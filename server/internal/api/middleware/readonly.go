@@ -11,21 +11,29 @@ func ReadOnly(isReadOnly func() bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if isReadOnly() {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusForbidden)
-
-				response := map[string]any{
-					"error":     "Operation not allowed in read-only mode",
-					"read_only": true,
-				}
-
-				if err := json.NewEncoder(w).Encode(response); err != nil {
-					http.Error(w, "Failed to encode response", http.StatusInternalServerError)
-				}
+				Block(w)
 				return
 			}
 
 			next.ServeHTTP(w, r)
 		})
+	}
+}
+
+// Block writes the standard 403 read-only response. Handlers that own their
+// own admission gate (terminal upgrade, one-shot exec) use it so a boundary
+// seal racing with an in-flight request is rejected with the exact same body
+// the middleware would have produced.
+func Block(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+
+	response := map[string]any{
+		"error":     "Operation not allowed in read-only mode",
+		"read_only": true,
+	}
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
 	}
 }

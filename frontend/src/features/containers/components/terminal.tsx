@@ -126,6 +126,12 @@ const buildWebSocketUrl = (containerId: string, host: string) => {
 	return `${wsProtocol}//${wsHost}/api/v1/containers/${containerId}/exec?${params.toString()}`;
 };
 
+// WebSocket close codes sent by the server for deliberate execution
+// boundaries. A dropped connection closes with 1006 (no close frame), so these
+// tell a boundary close apart from a network failure.
+const CLOSE_CODE_READ_ONLY = 4003;
+const CLOSE_CODE_SHUTDOWN = 4000;
+
 export function Terminal({ containerId, host }: TerminalProps) {
 	const { resolvedTheme } = useTheme();
 	const terminalRef = useRef<HTMLDivElement>(null);
@@ -238,10 +244,30 @@ export function Terminal({ containerId, host }: TerminalProps) {
 			term.scrollToBottom();
 		};
 
-		ws.onclose = () => {
+		ws.onclose = (event) => {
 			setIsConnected(false);
 			setIsReconnecting(false);
-			term.write("\r\n\x1b[31m✗ Connection closed\x1b[0m\r\n");
+			switch (event.code) {
+				case CLOSE_CODE_READ_ONLY:
+					// A deliberate read-only boundary close, not a network drop.
+					// No auto-reconnect: the old session is gone and a new one is
+					// refused while read-only. The user reconnects manually after
+					// the instance is writable again.
+					term.write(
+						"\r\n\x1b[33m⚠ Terminal closed: instance entered read-only mode\x1b[0m\r\n",
+					);
+					toast.error(
+						"Terminal closed because the instance entered read-only mode",
+					);
+					break;
+				case CLOSE_CODE_SHUTDOWN:
+					term.write(
+						"\r\n\x1b[33m⚠ Terminal closed: server is shutting down\x1b[0m\r\n",
+					);
+					break;
+				default:
+					term.write("\r\n\x1b[31m✗ Connection closed\x1b[0m\r\n");
+			}
 		};
 
 		ws.onerror = (error) => {

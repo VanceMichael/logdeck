@@ -12,7 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AmoabaKelvin/logdeck/internal/api/middleware"
 	"github.com/AmoabaKelvin/logdeck/internal/auth"
+	"github.com/AmoabaKelvin/logdeck/internal/execsession"
 	"github.com/AmoabaKelvin/logdeck/internal/models"
 	"github.com/docker/docker/api/types"
 	"github.com/gorilla/websocket"
@@ -45,11 +47,27 @@ type ResizeMessage struct {
 
 const terminalBufferSize = 32 * 1024
 
+// closeControlWait bounds how long the read-only boundary close frame waits to
+// leave the local socket; it is best-effort, the underlying connection is
+// closed regardless.
+const closeControlWait = time.Second
+
 func (ar *APIRouter) HandleTerminal(w http.ResponseWriter, r *http.Request) {
 	host, id, ok := containerParams(w, r)
 	if !ok {
 		return
 	}
+
+	// Admission first: once the read-only boundary is sealing, refuse before
+	// upgrading the connection or creating any Docker exec.
+	sess := ar.execSessions.Admit(execsession.KindTerminal, host, id)
+	if sess == nil {
+		middleware.Block(w)
+		return
+	}
+	// Every exit path (client disconnect, init failure, read-only termination)
+	// frees the registry entry.
+	defer sess.Release()
 
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -57,6 +75,30 @@ func (ar *APIRouter) HandleTerminal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer ws.Close()
+
+	// Boundary termination from this point on ends the WebSocket with an
+	// application-private close code, so the client can tell "read-only mode
+	// revoked this terminal" (4003 + reason text) from a dropped connection
+	// (abnormal closure 1006, no close frame). WriteControl is safe to run
+	// concurrently with the output pump; closing the underlying transport
+	// (instead of ws.Close) avoids queuing a second, generic close frame.
+	bindCloser := func(conn io.Closer) {
+		sess.Bind(func(reason execsession.Reason) {
+			code, text := execsession.CloseFrame(reason)
+			if writeErr := ws.WriteControl(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(code, text),
+				time.Now().Add(closeControlWait),
+			); writeErr != nil {
+				log.Printf("failed to send terminal close frame: %v", writeErr)
+			}
+			_ = ws.UnderlyingConn().Close()
+			if conn != nil {
+				_ = conn.Close()
+			}
+		})
+	}
+	bindCloser(nil)
 
 	ctx := r.Context()
 
@@ -69,6 +111,11 @@ func (ar *APIRouter) HandleTerminal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Close()
+
+	sess.SetExecID(execID)
+	// Replacing the binding adds the hijacked Docker connection to the teardown,
+	// which unblocks the output pump and detaches the container stream.
+	bindCloser(resp.Conn)
 
 	// Exec sessions grant shell access inside containers - audit them.
 	user := execAuditUser(r)

@@ -1,0 +1,1874 @@
+diff --git a/frontend/src/features/containers/components/terminal.tsx b/frontend/src/features/containers/components/terminal.tsx
+index fc601ba..757f2f8 100644
+--- a/frontend/src/features/containers/components/terminal.tsx
++++ b/frontend/src/features/containers/components/terminal.tsx
+@@ -126,6 +126,12 @@ const buildWebSocketUrl = (containerId: string, host: string) => {
+ 	return `${wsProtocol}//${wsHost}/api/v1/containers/${containerId}/exec?${params.toString()}`;
+ };
+ 
++// WebSocket close codes sent by the server for deliberate execution
++// boundaries. A dropped connection closes with 1006 (no close frame), so these
++// tell a boundary close apart from a network failure.
++const CLOSE_CODE_READ_ONLY = 4003;
++const CLOSE_CODE_SHUTDOWN = 4000;
++
+ export function Terminal({ containerId, host }: TerminalProps) {
+ 	const { resolvedTheme } = useTheme();
+ 	const terminalRef = useRef<HTMLDivElement>(null);
+@@ -238,10 +244,30 @@ export function Terminal({ containerId, host }: TerminalProps) {
+ 			term.scrollToBottom();
+ 		};
+ 
+-		ws.onclose = () => {
++		ws.onclose = (event) => {
+ 			setIsConnected(false);
+ 			setIsReconnecting(false);
+-			term.write("\r\n\x1b[31m✗ Connection closed\x1b[0m\r\n");
++			switch (event.code) {
++				case CLOSE_CODE_READ_ONLY:
++					// A deliberate read-only boundary close, not a network drop.
++					// No auto-reconnect: the old session is gone and a new one is
++					// refused while read-only. The user reconnects manually after
++					// the instance is writable again.
++					term.write(
++						"\r\n\x1b[33m⚠ Terminal closed: instance entered read-only mode\x1b[0m\r\n",
++					);
++					toast.error(
++						"Terminal closed because the instance entered read-only mode",
++					);
++					break;
++				case CLOSE_CODE_SHUTDOWN:
++					term.write(
++						"\r\n\x1b[33m⚠ Terminal closed: server is shutting down\x1b[0m\r\n",
++					);
++					break;
++				default:
++					term.write("\r\n\x1b[31m✗ Connection closed\x1b[0m\r\n");
++			}
+ 		};
+ 
+ 		ws.onerror = (error) => {
+diff --git a/frontend/src/features/settings/api/retry-read-only-cleanup.ts b/frontend/src/features/settings/api/retry-read-only-cleanup.ts
+new file mode 100644
+index 0000000..91cb83a
+--- /dev/null
++++ b/frontend/src/features/settings/api/retry-read-only-cleanup.ts
+@@ -0,0 +1,23 @@
++import { authenticatedFetch, readJson } from "@/lib/api-client";
++import { API_BASE_URL } from "@/types/api";
++
++import type { ReadOnlyCleanupReport } from "../types";
++
++const ENDPOINT = `${API_BASE_URL}/api/v1/settings/read-only/cleanup`;
++
++export interface RetryCleanupResult {
++	readOnly: boolean;
++	cleanup: ReadOnlyCleanupReport;
++}
++
++/** Re-attempts tearing down exec sessions left over by a read-only switch. */
++export async function retryReadOnlyCleanup(): Promise<RetryCleanupResult> {
++	const response = await authenticatedFetch(ENDPOINT, { method: "POST" });
++
++	if (!response.ok) {
++		const message = await response.text();
++		throw new Error(message || "Failed to retry cleanup");
++	}
++
++	return readJson<RetryCleanupResult>(response);
++}
+diff --git a/frontend/src/features/settings/api/update-read-only.ts b/frontend/src/features/settings/api/update-read-only.ts
+index f77b80d..eb3cbe4 100644
+--- a/frontend/src/features/settings/api/update-read-only.ts
++++ b/frontend/src/features/settings/api/update-read-only.ts
+@@ -1,9 +1,18 @@
+ import { authenticatedFetch, readJson } from "@/lib/api-client";
+ import { API_BASE_URL } from "@/types/api";
+ 
++import type { ReadOnlyCleanupReport } from "../types";
++
+ const ENDPOINT = `${API_BASE_URL}/api/v1/settings/read-only`;
+ 
+-export async function updateReadOnly(value: boolean): Promise<string> {
++export interface UpdateReadOnlyResult {
++	message: string;
++	readOnly: boolean;
++	/** Present when enabling: how the exec-session cleanup went. */
++	cleanup?: ReadOnlyCleanupReport;
++}
++
++export async function updateReadOnly(value: boolean): Promise<UpdateReadOnlyResult> {
+ 	const response = await authenticatedFetch(ENDPOINT, {
+ 		method: "PUT",
+ 		headers: { "Content-Type": "application/json" },
+@@ -15,6 +24,5 @@ export async function updateReadOnly(value: boolean): Promise<string> {
+ 		throw new Error(message || "Failed to update read-only mode");
+ 	}
+ 
+-	const data = await readJson<{ message?: string }>(response);
+-	return data.message ?? "Read-only mode updated";
++	return readJson<UpdateReadOnlyResult>(response);
+ }
+diff --git a/frontend/src/features/settings/components/read-only-section.tsx b/frontend/src/features/settings/components/read-only-section.tsx
+index 01f91dc..1810d84 100644
+--- a/frontend/src/features/settings/components/read-only-section.tsx
++++ b/frontend/src/features/settings/components/read-only-section.tsx
+@@ -1,8 +1,13 @@
++import { toast } from "sonner";
++
++import { Button } from "@/components/ui/button";
+ import { Switch } from "@/components/ui/switch";
+ 
+-import { useUpdateReadOnly } from "../hooks/use-settings";
++import {
++	useRetryReadOnlyCleanup,
++	useUpdateReadOnly,
++} from "../hooks/use-settings";
+ import type { ReadOnlyConfig } from "../types";
+-import { showResultToast } from "./mutation-toast";
+ import { EnvBadge, SettingsSection } from "./settings-ui";
+ 
+ interface ReadOnlySectionProps {
+@@ -12,11 +17,29 @@ interface ReadOnlySectionProps {
+ export function ReadOnlySection({ config }: ReadOnlySectionProps) {
+ 	const isEnv = config.source === "env";
+ 	const mutation = useUpdateReadOnly();
++	const retryMutation = useRetryReadOnlyCleanup();
++
++	const pending = config.cleanupPending ?? [];
++
++	const handleRetry = () => {
++		retryMutation.mutate(undefined, {
++			onSuccess: (result) => {
++				if (result.cleanup.pending.length === 0) {
++					toast.success("All open terminals and commands have been closed");
++				} else {
++					toast.warning(
++						`${result.cleanup.pending.length} session(s) are still unresponsive and remain blocked`,
++					);
++				}
++			},
++			onError: (error: Error) => toast.error(error.message),
++		});
++	};
+ 
+ 	return (
+ 		<SettingsSection
+ 			title="Read-only mode"
+-			description="Disables start, stop, restart and remove for everyone. Logs stay readable."
++			description="Disables start, stop, restart and remove for everyone. Logs stay readable. Enabling it closes every open terminal and running command first."
+ 			badge={isEnv && <EnvBadge />}
+ 			action={
+ 				<Switch
+@@ -24,12 +47,43 @@ export function ReadOnlySection({ config }: ReadOnlySectionProps) {
+ 					aria-label="Enable read-only mode"
+ 					checked={config.value}
+ 					onCheckedChange={(checked) =>
+-						mutation.mutate(checked, showResultToast)
++						mutation.mutate(checked, {
++							onSuccess: (result) => {
++								toast.success(result.message);
++								if (result.cleanup?.timedOut) {
++									toast.warning(
++										`Read-only is on, but ${result.cleanup.pending.length} session(s) did not stop in time and can be retried below`,
++									);
++								}
++							},
++							onError: (error: Error) => toast.error(error.message),
++						})
+ 					}
+ 					disabled={isEnv || mutation.isPending}
+ 					className="relative after:absolute after:-inset-x-1 after:-inset-y-3"
+ 				/>
+ 			}
+-		/>
++		>
++			{config.value && pending.length > 0 && (
++				<div className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3">
++					<p className="text-sm text-amber-700 dark:text-amber-300">
++						{pending.length} terminal/command
++						{pending.length === 1 ? " session" : " sessions"} could not be
++						stopped (an unresponsive Docker daemon, for example). New commands
++						stay blocked; retry the cleanup without leaving read-only mode.
++					</p>
++					<Button
++						type="button"
++						variant="outline"
++						size="sm"
++						onClick={handleRetry}
++						disabled={retryMutation.isPending}
++						className="ml-auto shrink-0"
++					>
++						{retryMutation.isPending ? "Retrying..." : "Retry cleanup"}
++					</Button>
++				</div>
++			)}
++		</SettingsSection>
+ 	);
+ }
+diff --git a/frontend/src/features/settings/hooks/use-settings.ts b/frontend/src/features/settings/hooks/use-settings.ts
+index de48d8f..c099995 100644
+--- a/frontend/src/features/settings/hooks/use-settings.ts
++++ b/frontend/src/features/settings/hooks/use-settings.ts
+@@ -18,6 +18,7 @@ import {
+ 	type UpdateLogStoragePayload,
+ 	updateLogStorage,
+ } from "../api/update-log-storage";
++import { retryReadOnlyCleanup } from "../api/retry-read-only-cleanup";
+ import { updateReadOnly } from "../api/update-read-only";
+ import type { APITokenScope } from "../types";
+ 
+@@ -95,6 +96,18 @@ export function useUpdateReadOnly() {
+ 	});
+ }
+ 
++// Retry terminating exec sessions a read-only switch could not finish. The
++// instance stays read-only regardless of the outcome.
++export function useRetryReadOnlyCleanup() {
++	const queryClient = useQueryClient();
++	return useMutation({
++		mutationFn: retryReadOnlyCleanup,
++		onSettled: () => {
++			queryClient.invalidateQueries({ queryKey: SETTINGS_KEY });
++		},
++	});
++}
++
+ // The usage bar and the per-container cap text read their limits from
+ // /history/status, so that query is invalidated alongside the settings.
+ export function useUpdateLogStorage() {
+diff --git a/frontend/src/features/settings/types.ts b/frontend/src/features/settings/types.ts
+index d220c20..e16ed15 100644
+--- a/frontend/src/features/settings/types.ts
++++ b/frontend/src/features/settings/types.ts
+@@ -37,9 +37,28 @@ export interface CoolifyHostsConfig {
+ 	revision?: string;
+ }
+ 
++/** A live exec session a read-only switch could not tear down in time. */
++export interface ReadOnlyCleanupPending {
++	id: string;
++	kind: "terminal" | "command";
++	host: string;
++	container: string;
++	execId?: string;
++	startedAt: string;
++	reason: string;
++}
++
++export interface ReadOnlyCleanupReport {
++	terminated: number;
++	timedOut: boolean;
++	pending: ReadOnlyCleanupPending[];
++}
++
+ export interface ReadOnlyConfig {
+ 	source: ConfigSource;
+ 	value: boolean;
++	/** Sessions still holding Docker resources after the cleanup wait. */
++	cleanupPending?: ReadOnlyCleanupPending[];
+ }
+ 
+ export interface AuthConfig {
+diff --git a/server/cmd/server/main.go b/server/cmd/server/main.go
+index 80aae9d..acaeaa6 100644
+--- a/server/cmd/server/main.go
++++ b/server/cmd/server/main.go
+@@ -18,6 +18,7 @@ import (
+ 	"github.com/AmoabaKelvin/logdeck/internal/coolify"
+ 	"github.com/AmoabaKelvin/logdeck/internal/docker"
+ 	"github.com/AmoabaKelvin/logdeck/internal/dokploy"
++	"github.com/AmoabaKelvin/logdeck/internal/execsession"
+ 	"github.com/AmoabaKelvin/logdeck/internal/logstore"
+ 	"github.com/AmoabaKelvin/logdeck/internal/logstream"
+ 	"github.com/AmoabaKelvin/logdeck/internal/services"
+@@ -76,6 +77,11 @@ func main() {
+ 
+ 	registry := services.NewRegistry(multiHostClient, coolifyClient, authService, cfg)
+ 
++	// The read-only execution boundary. It starts sealed when the instance
++	// boots under READONLY_MODE, and it owns the termination of live terminal
++	// and one-shot exec sessions on read-only entry and on shutdown.
++	execSupervisor := execsession.New(cfg.ReadOnly)
++
+ 	logHub := logstream.New(registry)
+ 	alertEngine := alerts.NewEngine(registry, manager, logHub)
+ 	// logStore is nil when persistence is disabled or its database is
+@@ -114,7 +120,7 @@ func main() {
+ 		log.Println("Configuration reloaded successfully")
+ 	})
+ 
+-	apiRouter := api.NewRouter(registry, manager, alertEngine, logStore, version)
++	apiRouter := api.NewRouter(registry, manager, alertEngine, execSupervisor, logStore, version)
+ 
+ 	// No WriteTimeout/IdleTimeout: log streaming and terminal WebSockets are
+ 	// long-lived connections and would be killed by them. ReadTimeout only
+@@ -166,6 +172,14 @@ func main() {
+ 	<-ctx.Done()
+ 	log.Println("Shutting down server...")
+ 
++	// Close live terminal and one-shot exec sessions first: their hijacked
++	// connections are invisible to server.Shutdown, so ending them with the
++	// shutdown close code releases the registry entries and Docker streams
++	// before the HTTP server drains.
++	if report := execSupervisor.Shutdown(5 * time.Second); report.TimedOut {
++		log.Printf("Shutdown: %d exec session(s) did not release in time", len(report.Pending))
++	}
++
+ 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+ 	defer cancel()
+ 	if err := server.Shutdown(shutdownCtx); err != nil {
+diff --git a/server/internal/api/alerts_handlers_test.go b/server/internal/api/alerts_handlers_test.go
+index f2e6d5c..46b50ee 100644
+--- a/server/internal/api/alerts_handlers_test.go
++++ b/server/internal/api/alerts_handlers_test.go
+@@ -37,7 +37,7 @@ func newAlertsTestRouter(t *testing.T, authSvc *auth.Service) (http.Handler, str
+ 	manager := config.NewManager()
+ 	registry := services.NewRegistry(nil, nil, authSvc, manager.Config())
+ 	engine := alerts.NewEngine(registry, manager, nil)
+-	return NewRouter(registry, manager, engine, nil, "test"), configPath
++	return NewRouter(registry, manager, engine, testExecSupervisor(), nil, "test"), configPath
+ }
+ 
+ func doAlertsRequest(t *testing.T, router http.Handler, method, path, body string) *httptest.ResponseRecorder {
+diff --git a/server/internal/api/compose_handlers.go b/server/internal/api/compose_handlers.go
+index 3d8029a..89aed08 100644
+--- a/server/internal/api/compose_handlers.go
++++ b/server/internal/api/compose_handlers.go
+@@ -16,9 +16,7 @@ var validComposeActions = map[string]bool{
+ func (ar *APIRouter) registerComposeRoutes(r chi.Router) {
+ 	// Mutating routes (blocked in read-only mode)
+ 	r.Group(func(mutating chi.Router) {
+-		mutating.Use(middleware.ReadOnly(func() bool {
+-			return ar.registry.Config().ReadOnly
+-		}))
++		mutating.Use(middleware.ReadOnly(ar.readOnlyAdmission))
+ 		mutating.Post("/compose/{project}/{action}", ar.ComposeAction)
+ 	})
+ }
+diff --git a/server/internal/api/dokploy_env_test.go b/server/internal/api/dokploy_env_test.go
+index 39d79c1..b899c83 100644
+--- a/server/internal/api/dokploy_env_test.go
++++ b/server/internal/api/dokploy_env_test.go
+@@ -55,7 +55,7 @@ func TestDokployMappingSaveAndDeploy(t *testing.T) {
+ 	}
+ 	defer func() { client, _ := dc.GetClient("local"); _ = client.Close() }()
+ 	cfg := &config.Config{DokployHosts: []config.DokployHostConfig{{HostName: "local", APIURL: platform.URL + "/api", APIToken: "token"}}}
+-	ar := &APIRouter{registry: services.NewRegistry(dc, nil, nil, cfg)}
++	ar := &APIRouter{registry: services.NewRegistry(dc, nil, nil, cfg), execSessions: testExecSupervisor()}
+ 	router := chi.NewRouter()
+ 	router.Route("/api/v1", ar.registerContainerRoutes)
+ 	request := func(method, query, body string) *httptest.ResponseRecorder {
+diff --git a/server/internal/api/env_handlers_test.go b/server/internal/api/env_handlers_test.go
+index 2d85536..c6eab30 100644
+--- a/server/internal/api/env_handlers_test.go
++++ b/server/internal/api/env_handlers_test.go
+@@ -48,7 +48,7 @@ func envRouterWithEngine(t *testing.T, engine *httptest.Server, upstream http.Ha
+ 		t.Cleanup(platform.Close)
+ 		cc = coolify.NewMultiClient([]config.CoolifyHostConfig{{HostName: "local", APIURL: platform.URL, APIToken: "token"}})
+ 	}
+-	ar := &APIRouter{registry: services.NewRegistry(dc, cc, nil, &config.Config{})}
++	ar := &APIRouter{registry: services.NewRegistry(dc, cc, nil, &config.Config{}), execSessions: testExecSupervisor()}
+ 	router := chi.NewRouter()
+ 	router.Route("/api/v1", ar.registerContainerRoutes)
+ 	return router
+diff --git a/server/internal/api/handlers.go b/server/internal/api/handlers.go
+index 91a1bd1..61d9c16 100644
+--- a/server/internal/api/handlers.go
++++ b/server/internal/api/handlers.go
+@@ -11,8 +11,10 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"github.com/AmoabaKelvin/logdeck/internal/api/middleware"
+ 	"github.com/AmoabaKelvin/logdeck/internal/auth"
+ 	"github.com/AmoabaKelvin/logdeck/internal/docker"
++	"github.com/AmoabaKelvin/logdeck/internal/execsession"
+ 	"github.com/AmoabaKelvin/logdeck/internal/models"
+ 	"github.com/AmoabaKelvin/logdeck/internal/system"
+ 	"github.com/docker/docker/api/types/container"
+@@ -207,11 +209,36 @@ func (ar *APIRouter) RunCommand(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	// Admission gate: refuse once the read-only boundary is sealing, before a
++	// Docker exec exists. The ReadOnly middleware covers the common path; this
++	// closes the race window between sealing and the config remerge.
++	sess := ar.execSessions.Admit(execsession.KindCommand, host, id)
++	if sess == nil {
++		middleware.Block(w)
++		return
++	}
++	defer sess.Release()
++
+ 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+ 	defer cancel()
++	// Boundary termination cancels the command's context; RunExec then closes
++	// the hijacked connection and returns ctx.Err() instead of running to
++	// completion in the background.
++	sess.Bind(func(execsession.Reason) { cancel() })
+ 
+-	stdout, stderr, exitCode, truncated, err := ar.registry.Docker().RunExec(ctx, host, id, []string{"/bin/sh", "-c", req.Command})
++	stdout, stderr, exitCode, truncated, err := ar.registry.Docker().RunExec(ctx, host, id, []string{"/bin/sh", "-c", req.Command}, sess.SetExecID)
+ 	if err != nil {
++		// A read-only revocation is a deliberate, structured conflict, not a
++		// daemon failure (500) or a dropped client connection (no response
++		// delivered), so callers can retry after the instance is writable again.
++		if reason, revoked := sess.TerminationCause(); revoked && reason == execsession.ReasonReadOnly {
++			WriteJsonResponse(w, http.StatusConflict, map[string]any{
++				"error":     "command revoked: the instance entered read-only mode",
++				"code":      "EXEC_REVOKED_READ_ONLY",
++				"read_only": true,
++			})
++			return
++		}
+ 		http.Error(w, err.Error(), http.StatusInternalServerError)
+ 		return
+ 	}
+diff --git a/server/internal/api/history_handlers_test.go b/server/internal/api/history_handlers_test.go
+index 321bfc3..51e3a8b 100644
+--- a/server/internal/api/history_handlers_test.go
++++ b/server/internal/api/history_handlers_test.go
+@@ -43,7 +43,7 @@ func newHistoryTestRouterWithAuth(t *testing.T, store *logstore.Store, authSvc *
+ 	manager := config.NewManager()
+ 	registry := services.NewRegistry(nil, nil, authSvc, manager.Config())
+ 	engine := alerts.NewEngine(registry, manager, nil)
+-	return NewRouter(registry, manager, engine, store, "test")
++	return NewRouter(registry, manager, engine, testExecSupervisor(), store, "test")
+ }
+ 
+ // newHistoryStore opens a real store over a temp database and returns it with
+@@ -759,7 +759,7 @@ func TestDeleteHistoryContainerReadOnlyMode(t *testing.T) {
+ 
+ 	manager := config.NewManager()
+ 	registry := services.NewRegistry(nil, nil, nil, manager.Config())
+-	router := NewRouter(registry, manager, alerts.NewEngine(registry, manager, nil), store, "test")
++	router := NewRouter(registry, manager, alerts.NewEngine(registry, manager, nil), testExecSupervisor(), store, "test")
+ 
+ 	w := doHistoryDelete(t, router, "/api/v1/history/containers/web?host=local", "")
+ 	if w.Code != http.StatusForbidden {
+diff --git a/server/internal/api/middleware/readonly.go b/server/internal/api/middleware/readonly.go
+index effb7fc..26f9347 100644
+--- a/server/internal/api/middleware/readonly.go
++++ b/server/internal/api/middleware/readonly.go
+@@ -11,17 +11,7 @@ func ReadOnly(isReadOnly func() bool) func(http.Handler) http.Handler {
+ 	return func(next http.Handler) http.Handler {
+ 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 			if isReadOnly() {
+-				w.Header().Set("Content-Type", "application/json")
+-				w.WriteHeader(http.StatusForbidden)
+-
+-				response := map[string]any{
+-					"error":     "Operation not allowed in read-only mode",
+-					"read_only": true,
+-				}
+-
+-				if err := json.NewEncoder(w).Encode(response); err != nil {
+-					http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+-				}
++				Block(w)
+ 				return
+ 			}
+ 
+@@ -29,3 +19,21 @@ func ReadOnly(isReadOnly func() bool) func(http.Handler) http.Handler {
+ 		})
+ 	}
+ }
++
++// Block writes the standard 403 read-only response. Handlers that own their
++// own admission gate (terminal upgrade, one-shot exec) use it so a boundary
++// seal racing with an in-flight request is rejected with the exact same body
++// the middleware would have produced.
++func Block(w http.ResponseWriter) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(http.StatusForbidden)
++
++	response := map[string]any{
++		"error":     "Operation not allowed in read-only mode",
++		"read_only": true,
++	}
++
++	if err := json.NewEncoder(w).Encode(response); err != nil {
++		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
++	}
++}
+diff --git a/server/internal/api/readonly_boundary_test.go b/server/internal/api/readonly_boundary_test.go
+new file mode 100644
+index 0000000..ee49b76
+--- /dev/null
++++ b/server/internal/api/readonly_boundary_test.go
+@@ -0,0 +1,229 @@
++package api
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"path/filepath"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"github.com/AmoabaKelvin/logdeck/internal/config"
++	"github.com/AmoabaKelvin/logdeck/internal/execsession"
++	"github.com/AmoabaKelvin/logdeck/internal/services"
++)
++
++// testExecSupervisor gives the shared router-test builders a writable
++// exec-session registry; tests for the read-only boundary build their own.
++func testExecSupervisor() *execsession.Supervisor {
++	return execsession.New(false)
++}
++
++func newBoundaryRouter(t *testing.T, readonlyEnv string) (http.Handler, *config.Manager, *execsession.Supervisor) {
++	t.Helper()
++	for _, key := range []string{
++		"JWT_SECRET", "ADMIN_USERNAME", "ADMIN_PASSWORD", "ADMIN_PASSWORD_SALT",
++		"DOCKER_HOSTS", "COOLIFY_CONFIGS", "READONLY_MODE", "CORS_ALLOWED_ORIGINS",
++	} {
++		t.Setenv(key, "")
++	}
++	if readonlyEnv != "" {
++		t.Setenv("READONLY_MODE", readonlyEnv)
++	}
++	t.Setenv("CONFIG_PATH", filepath.Join(t.TempDir(), "config.json"))
++
++	manager := config.NewManager()
++	registry := services.NewRegistry(nil, nil, nil, manager.Config())
++	// Mirror main.go: merged config changes propagate into the registry.
++	manager.OnChange(registry.UpdateConfig)
++	supervisor := execsession.New(manager.Config().ReadOnly)
++	return NewRouter(registry, manager, nil, supervisor, nil, "test"), manager, supervisor
++}
++
++func putReadOnly(t *testing.T, router http.Handler, value string) *httptest.ResponseRecorder {
++	t.Helper()
++	w := httptest.NewRecorder()
++	router.ServeHTTP(w, httptest.NewRequest(http.MethodPut,
++		"/api/v1/settings/read-only", strings.NewReader(`{"value":`+value+`}`)))
++	return w
++}
++
++func decodeCleanup(t *testing.T, w *httptest.ResponseRecorder) struct {
++	Message  string `json:"message"`
++	ReadOnly bool   `json:"readOnly"`
++	Cleanup  struct {
++		Terminated int  `json:"terminated"`
++		TimedOut   bool `json:"timedOut"`
++		Pending    []map[string]any
++	} `json:"cleanup"`
++} {
++	t.Helper()
++	var body struct {
++		Message  string `json:"message"`
++		ReadOnly bool   `json:"readOnly"`
++		Cleanup  struct {
++			Terminated int  `json:"terminated"`
++			TimedOut   bool `json:"timedOut"`
++			Pending    []map[string]any
++		} `json:"cleanup"`
++	}
++	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
++		t.Fatalf("decode response %q: %v", w.Body.String(), err)
++	}
++	return body
++}
++
++// TestUpdateReadOnlyBoundaryTerminatesActiveSession covers the full boundary
++// through the settings API: admission is sealed, the live session is
++// terminated and releases, and the response reports it.
++func TestUpdateReadOnlyBoundaryTerminatesActiveSession(t *testing.T) {
++	router, manager, supervisor := newBoundaryRouter(t, "")
++
++	sess := supervisor.Admit(execsession.KindTerminal, "prod", "c1")
++	if sess == nil {
++		t.Fatal("expected writable admission")
++	}
++	var terminated atomic.Bool
++	sess.Bind(func(execsession.Reason) {
++		terminated.Store(true)
++		sess.Release()
++	})
++
++	w := putReadOnly(t, router, "true")
++	if w.Code != http.StatusOK {
++		t.Fatalf("PUT = %d, want 200: %s", w.Code, w.Body.String())
++	}
++	body := decodeCleanup(t, w)
++	if !body.ReadOnly || body.Cleanup.Terminated != 1 || body.Cleanup.TimedOut {
++		t.Fatalf("unexpected response: %+v", body)
++	}
++	if !terminated.Load() {
++		t.Fatal("the live session was not terminated")
++	}
++	if !supervisor.IsSealed() {
++		t.Fatal("admission not sealed after enabling read-only")
++	}
++	if supervisor.Admit(execsession.KindCommand, "prod", "c1") != nil {
++		t.Fatal("new exec session admitted after the boundary closed")
++	}
++	ro := manager.FileConfigSnapshot().ReadOnly
++	if ro == nil || !*ro {
++		t.Fatal("read-only was not persisted to the config file")
++	}
++}
++
++// TestUpdateReadOnlyNoActiveExecsKeepsLegacyBehavior proves the no-exec path
++// behaves as before apart from the additive cleanup report, and switching
++// back reopens admission.
++func TestUpdateReadOnlyNoActiveExecsKeepsLegacyBehavior(t *testing.T) {
++	router, _, supervisor := newBoundaryRouter(t, "")
++
++	w := putReadOnly(t, router, "true")
++	if w.Code != http.StatusOK {
++		t.Fatalf("PUT = %d: %s", w.Code, w.Body.String())
++	}
++	body := decodeCleanup(t, w)
++	if body.Message != "Read-only mode updated" {
++		t.Fatalf("message = %q", body.Message)
++	}
++	if body.Cleanup.Terminated != 0 || body.Cleanup.TimedOut || len(body.Cleanup.Pending) != 0 {
++		t.Fatalf("cleanup should be empty with no execs, got %+v", body.Cleanup)
++	}
++
++	if w := putReadOnly(t, router, "false"); w.Code != http.StatusOK {
++		t.Fatalf("disable = %d: %s", w.Code, w.Body.String())
++	}
++	if supervisor.IsSealed() {
++		t.Fatal("admission still sealed after switching back to writable")
++	}
++	if supervisor.Admit(execsession.KindTerminal, "prod", "c1") == nil {
++		t.Fatal("new terminal not admitted after writable switch")
++	}
++}
++
++// TestUpdateReadOnlyEnvLockedRejected verifies an env-pinned read-only setting
++// keeps its 409 behavior on both directions and never changes the seal: an
++// env-locked instance boots sealed and stays sealed.
++func TestUpdateReadOnlyEnvLockedRejected(t *testing.T) {
++	router, _, supervisor := newBoundaryRouter(t, "true")
++
++	if !supervisor.IsSealed() {
++		t.Fatal("env-locked read-only must seal at startup")
++	}
++	if supervisor.Admit(execsession.KindTerminal, "prod", "c1") != nil {
++		t.Fatal("env-locked instance admitted an exec session")
++	}
++
++	for _, value := range []string{"true", "false"} {
++		w := putReadOnly(t, router, value)
++		if w.Code != http.StatusConflict {
++			t.Fatalf("PUT value=%s = %d, want 409: %s", value, w.Code, w.Body.String())
++		}
++		if !strings.Contains(w.Body.String(), "environment variable") {
++			t.Fatalf("missing env-lock message: %s", w.Body.String())
++		}
++		if !supervisor.IsSealed() {
++			t.Fatalf("seal changed after rejected env-locked update (value=%s)", value)
++		}
++	}
++}
++
++// TestRetryReadOnlyCleanup covers the retry endpoint: available while
++// read-only, 409 once writable.
++func TestRetryReadOnlyCleanup(t *testing.T) {
++	router, _, supervisor := newBoundaryRouter(t, "")
++
++	if w := putReadOnly(t, router, "true"); w.Code != http.StatusOK {
++		t.Fatalf("enable = %d: %s", w.Code, w.Body.String())
++	}
++
++	post := func() *httptest.ResponseRecorder {
++		w := httptest.NewRecorder()
++		router.ServeHTTP(w, httptest.NewRequest(http.MethodPost,
++			"/api/v1/settings/read-only/cleanup", nil))
++		return w
++	}
++	if w := post(); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"readOnly":true`) {
++		t.Fatalf("retry while read-only = %d: %s", w.Code, w.Body.String())
++	}
++
++	if w := putReadOnly(t, router, "false"); w.Code != http.StatusOK {
++		t.Fatalf("disable = %d: %s", w.Code, w.Body.String())
++	}
++	if w := post(); w.Code != http.StatusConflict {
++		t.Fatalf("retry while writable = %d, want 409: %s", w.Code, w.Body.String())
++	}
++	_ = supervisor
++}
++
++// TestGetSettingsReportsEmptyCleanupPending ensures the readOnly block keeps
++// its old fields and adds the additive cleanupPending list.
++func TestGetSettingsReportsEmptyCleanupPending(t *testing.T) {
++	router, _, _ := newBoundaryRouter(t, "")
++	if w := putReadOnly(t, router, "true"); w.Code != http.StatusOK {
++		t.Fatalf("enable = %d", w.Code)
++	}
++
++	w := httptest.NewRecorder()
++	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/settings", nil))
++	if w.Code != http.StatusOK {
++		t.Fatalf("GET settings = %d: %s", w.Code, w.Body.String())
++	}
++	var body struct {
++		ReadOnly struct {
++			Source         string           `json:"source"`
++			Value          bool             `json:"value"`
++			CleanupPending []map[string]any `json:"cleanupPending"`
++		} `json:"readOnly"`
++	}
++	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
++		t.Fatal(err)
++	}
++	if !body.ReadOnly.Value || body.ReadOnly.Source != "file" {
++		t.Fatalf("readOnly block = %+v", body.ReadOnly)
++	}
++	if body.ReadOnly.CleanupPending == nil {
++		t.Fatal("cleanupPending should be an empty list, not null")
++	}
++}
+diff --git a/server/internal/api/router.go b/server/internal/api/router.go
+index 47b1661..1a0f06b 100644
+--- a/server/internal/api/router.go
++++ b/server/internal/api/router.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/AmoabaKelvin/logdeck/internal/api/middleware"
+ 	"github.com/AmoabaKelvin/logdeck/internal/auth"
+ 	"github.com/AmoabaKelvin/logdeck/internal/config"
++	"github.com/AmoabaKelvin/logdeck/internal/execsession"
+ 	"github.com/AmoabaKelvin/logdeck/internal/logstore"
+ 	"github.com/AmoabaKelvin/logdeck/internal/services"
+ 	"github.com/AmoabaKelvin/logdeck/internal/static"
+@@ -19,10 +20,11 @@ import (
+ )
+ 
+ type APIRouter struct {
+-	router   *chi.Mux
+-	registry *services.Registry
+-	manager  *config.Manager
+-	engine   *alerts.Engine
++	router       *chi.Mux
++	registry     *services.Registry
++	manager      *config.Manager
++	engine       *alerts.Engine
++	execSessions *execsession.Supervisor
+ 	// logStore is nil when log persistence is disabled or unusable.
+ 	logStore *logstore.Store
+ 	version  string
+@@ -32,19 +34,28 @@ type APIRouter struct {
+ 	machineHostname   string
+ }
+ 
+-func NewRouter(registry *services.Registry, manager *config.Manager, engine *alerts.Engine, logStore *logstore.Store, version string) *chi.Mux {
++func NewRouter(registry *services.Registry, manager *config.Manager, engine *alerts.Engine, execSessions *execsession.Supervisor, logStore *logstore.Store, version string) *chi.Mux {
+ 	r := &APIRouter{
+-		router:   chi.NewRouter(),
+-		registry: registry,
+-		manager:  manager,
+-		engine:   engine,
+-		logStore: logStore,
+-		version:  version,
++		router:       chi.NewRouter(),
++		registry:     registry,
++		manager:      manager,
++		engine:       engine,
++		execSessions: execSessions,
++		logStore:     logStore,
++		version:      version,
+ 	}
+ 
+ 	return r.Routes()
+ }
+ 
++// readOnlyAdmission is the single predicate every mutating route consults: it
++// is true for persisted read-only mode (file or env, hot-reloaded through the
++// registry config) and during the sealing window of a read-only transition,
++// before the config remerge lands.
++func (ar *APIRouter) readOnlyAdmission() bool {
++	return ar.registry.Config().ReadOnly || ar.execSessions.IsSealed()
++}
++
+ func WriteJsonResponse(w http.ResponseWriter, status int, data any) {
+ 	payload, err := json.Marshal(data)
+ 	if err != nil {
+@@ -133,9 +144,7 @@ func (ar *APIRouter) registerContainerRoutes(r chi.Router) {
+ 
+ 		// Mutating routes (blocked in read-only mode)
+ 		r.Group(func(mutating chi.Router) {
+-			mutating.Use(middleware.ReadOnly(func() bool {
+-				return ar.registry.Config().ReadOnly
+-			}))
++			mutating.Use(middleware.ReadOnly(ar.readOnlyAdmission))
+ 			mutating.Post("/start", ar.StartContainer)
+ 			mutating.Post("/stop", ar.StopContainer)
+ 			mutating.Post("/restart", ar.RestartContainer)
+@@ -164,7 +173,7 @@ func (ar *APIRouter) registerHistoryRoutes(r chi.Router) {
+ 	r.Get("/history/logs", ar.GetHistoryLogs)
+ 
+ 	destructive := r.With(
+-		middleware.ReadOnly(func() bool { return ar.registry.Config().ReadOnly }),
++		middleware.ReadOnly(ar.readOnlyAdmission),
+ 		auth.DenyReadScope,
+ 	)
+ 	destructive.Delete("/history/containers", ar.DeleteHistoryAll)
+@@ -185,12 +194,16 @@ func (ar *APIRouter) registerSettingsRoutes(r chi.Router) {
+ 		r.Put("/coolify-hosts", ar.UpdateCoolifyHosts)
+ 		r.Put("/dokploy-hosts", ar.UpdateDokployHosts)
+ 		r.Put("/read-only", ar.UpdateReadOnly)
++		// Retry tearing down exec sessions a previous read-only switch could
++		// not finish (e.g. an unresponsive daemon). Read-only stays in force
++		// until every session releases or the operator switches back.
++		r.Post("/read-only/cleanup", ar.RetryReadOnlyCleanup)
+ 		r.Put("/auth", ar.UpdateAuth)
+ 		// Lowering a retention cap makes the next janitor pass evict stored
+ 		// logs, so this route is blocked in read-only mode like the purge route
+ 		// — the other settings mutations touch no data and are not.
+ 		r.With(
+-			middleware.ReadOnly(func() bool { return ar.registry.Config().ReadOnly }),
++			middleware.ReadOnly(ar.readOnlyAdmission),
+ 		).Put("/log-storage", ar.UpdateLogStorage)
+ 		r.Get("/api-tokens", ar.ListAPITokens)
+ 		r.Post("/api-tokens", ar.CreateAPIToken)
+diff --git a/server/internal/api/settings_apitokens_test.go b/server/internal/api/settings_apitokens_test.go
+index 9c9401a..a9e8ba3 100644
+--- a/server/internal/api/settings_apitokens_test.go
++++ b/server/internal/api/settings_apitokens_test.go
+@@ -370,7 +370,7 @@ func TestLegacyAPITokenWithoutScopeIsAdmin(t *testing.T) {
+ 	svc := newTestAuthService(t)
+ 	manager := config.NewManager()
+ 	registry := services.NewRegistry(nil, nil, svc, manager.Config())
+-	router := NewRouter(registry, manager, nil, nil, "test")
++	router := NewRouter(registry, manager, nil, testExecSupervisor(), nil, "test")
+ 
+ 	// The legacy token is listed with an admin scope.
+ 	w := httptest.NewRecorder()
+diff --git a/server/internal/api/settings_auth_test.go b/server/internal/api/settings_auth_test.go
+index d292829..ce72f61 100644
+--- a/server/internal/api/settings_auth_test.go
++++ b/server/internal/api/settings_auth_test.go
+@@ -25,7 +25,7 @@ func newTestRouter(t *testing.T, authSvc *auth.Service) http.Handler {
+ 
+ 	manager := config.NewManager()
+ 	registry := services.NewRegistry(nil, nil, authSvc, manager.Config())
+-	return NewRouter(registry, manager, nil, nil, "test")
++	return NewRouter(registry, manager, nil, testExecSupervisor(), nil, "test")
+ }
+ 
+ func newTestAuthService(t *testing.T) *auth.Service {
+diff --git a/server/internal/api/settings_handlers.go b/server/internal/api/settings_handlers.go
+index f3a2daf..3944b36 100644
+--- a/server/internal/api/settings_handlers.go
++++ b/server/internal/api/settings_handlers.go
+@@ -90,6 +90,17 @@ func (ar *APIRouter) GetSettings(w http.ResponseWriter, r *http.Request) {
+ 	logStore := ar.manager.LogStore()
+ 	logStoreSources := ar.manager.LogStoreSources()
+ 
++	// cleanupPending only has meaning while read-only; report an empty list
++	// once writable so fresh sessions are never mistaken for leftovers.
++	readOnlyBlock := map[string]any{
++		"source":         sources.ReadOnly,
++		"value":          cfg.ReadOnly,
++		"cleanupPending": []any{},
++	}
++	if cfg.ReadOnly {
++		readOnlyBlock["cleanupPending"] = ar.execSessions.Pending()
++	}
++
+ 	WriteJsonResponse(w, http.StatusOK, map[string]any{
+ 		"dockerHosts": map[string]any{
+ 			"source":   sources.DockerHosts,
+@@ -116,11 +127,8 @@ func (ar *APIRouter) GetSettings(w http.ResponseWriter, r *http.Request) {
+ 			"hosts":    dokployHosts,
+ 			"revision": config.HostsRevision(cfg.DokployHosts),
+ 		},
+-		"readOnly": map[string]any{
+-			"source": sources.ReadOnly,
+-			"value":  cfg.ReadOnly,
+-		},
+-		"auth": authResp,
++		"readOnly": readOnlyBlock,
++		"auth":     authResp,
+ 	})
+ }
+ 
+@@ -234,7 +242,20 @@ func (ar *APIRouter) UpdateCoolifyHosts(w http.ResponseWriter, r *http.Request)
+ 	WriteJsonResponse(w, http.StatusOK, map[string]any{"message": "Coolify hosts updated"})
+ }
+ 
++// readOnlyCleanupTimeout bounds how long the read-only switch waits for live
++// terminal and one-shot exec sessions to terminate and release. Sessions that
++// outlast it are reported in the response and stay retryable; the switch
++// itself never rolls back to writable because of them.
++const readOnlyCleanupTimeout = 10 * time.Second
++
+ // UpdateReadOnly handles PUT /api/v1/settings/read-only.
++//
++// Enabling is an execution boundary: the supervisor seals new terminal and
++// exec admission first, the config is persisted next (a persistence failure
++// reopens admission and leaves existing sessions untouched), and only after
++// every tracked session terminates — or the bounded cleanup wait elapses with
++// the leftovers reported — does the response return. Disabling persists first
++// and unseals only on success, so a disk failure cannot silently reopen writes.
+ func (ar *APIRouter) UpdateReadOnly(w http.ResponseWriter, r *http.Request) {
+ 	var req struct {
+ 		Value bool `json:"value"`
+@@ -244,12 +265,41 @@ func (ar *APIRouter) UpdateReadOnly(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	if err := ar.manager.UpdateReadOnly(req.Value); err != nil {
++	report, err := ar.execSessions.Transition(req.Value, func() error {
++		return ar.manager.UpdateReadOnly(req.Value)
++	}, readOnlyCleanupTimeout)
++	if err != nil {
+ 		http.Error(w, err.Error(), settingsErrorStatus(err))
+ 		return
+ 	}
+ 
+-	WriteJsonResponse(w, http.StatusOK, map[string]any{"message": "Read-only mode updated"})
++	response := map[string]any{
++		"message":  "Read-only mode updated",
++		"readOnly": req.Value,
++	}
++	// The cleanup report is additive: clients built for the old shape still
++	// see the message field. With no active execs it is simply an empty report,
++	// preserving the previous switching behavior.
++	if req.Value {
++		response["cleanup"] = report
++	}
++	WriteJsonResponse(w, http.StatusOK, response)
++}
++
++// RetryReadOnlyCleanup handles POST /api/v1/settings/read-only/cleanup: it
++// re-attempts termination of exec sessions a previous read-only entry could
++// not finish (for example an unresponsive Docker daemon). Read-only mode and
++// the admission seal stay in force regardless of the outcome.
++func (ar *APIRouter) RetryReadOnlyCleanup(w http.ResponseWriter, r *http.Request) {
++	report, err := ar.execSessions.RetryCleanup(readOnlyCleanupTimeout)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusConflict)
++		return
++	}
++	WriteJsonResponse(w, http.StatusOK, map[string]any{
++		"readOnly": true,
++		"cleanup":  report,
++	})
+ }
+ 
+ // maxLogStoreMB bounds a retention cap at 1 TiB — far past any sensible SQLite
+diff --git a/server/internal/api/settings_logstore_test.go b/server/internal/api/settings_logstore_test.go
+index 9c52908..5a0d977 100644
+--- a/server/internal/api/settings_logstore_test.go
++++ b/server/internal/api/settings_logstore_test.go
+@@ -28,7 +28,7 @@ func newLogStoreTestRouter(t *testing.T, authSvc *auth.Service) (http.Handler, *
+ 
+ 	manager := config.NewManager()
+ 	registry := services.NewRegistry(nil, nil, authSvc, manager.Config())
+-	return NewRouter(registry, manager, nil, nil, "test"), manager
++	return NewRouter(registry, manager, nil, testExecSupervisor(), nil, "test"), manager
+ }
+ 
+ func putLogStorage(t *testing.T, router http.Handler, body string) *httptest.ResponseRecorder {
+@@ -206,7 +206,7 @@ func TestUpdateLogStorageRejectedInReadOnlyMode(t *testing.T) {
+ 
+ 	manager := config.NewManager()
+ 	registry := services.NewRegistry(nil, nil, nil, manager.Config())
+-	router := NewRouter(registry, manager, nil, nil, "test")
++	router := NewRouter(registry, manager, nil, testExecSupervisor(), nil, "test")
+ 
+ 	// Lowering a cap evicts stored logs, so it is blocked like any other
+ 	// destructive route.
+diff --git a/server/internal/api/terminal.go b/server/internal/api/terminal.go
+index cd8ba23..724c8e4 100644
+--- a/server/internal/api/terminal.go
++++ b/server/internal/api/terminal.go
+@@ -12,7 +12,9 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"github.com/AmoabaKelvin/logdeck/internal/api/middleware"
+ 	"github.com/AmoabaKelvin/logdeck/internal/auth"
++	"github.com/AmoabaKelvin/logdeck/internal/execsession"
+ 	"github.com/AmoabaKelvin/logdeck/internal/models"
+ 	"github.com/docker/docker/api/types"
+ 	"github.com/gorilla/websocket"
+@@ -45,12 +47,28 @@ type ResizeMessage struct {
+ 
+ const terminalBufferSize = 32 * 1024
+ 
++// closeControlWait bounds how long the read-only boundary close frame waits to
++// leave the local socket; it is best-effort, the underlying connection is
++// closed regardless.
++const closeControlWait = time.Second
++
+ func (ar *APIRouter) HandleTerminal(w http.ResponseWriter, r *http.Request) {
+ 	host, id, ok := containerParams(w, r)
+ 	if !ok {
+ 		return
+ 	}
+ 
++	// Admission first: once the read-only boundary is sealing, refuse before
++	// upgrading the connection or creating any Docker exec.
++	sess := ar.execSessions.Admit(execsession.KindTerminal, host, id)
++	if sess == nil {
++		middleware.Block(w)
++		return
++	}
++	// Every exit path (client disconnect, init failure, read-only termination)
++	// frees the registry entry.
++	defer sess.Release()
++
+ 	ws, err := upgrader.Upgrade(w, r, nil)
+ 	if err != nil {
+ 		log.Printf("websocket upgrade failed: %v", err)
+@@ -58,6 +76,30 @@ func (ar *APIRouter) HandleTerminal(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	defer ws.Close()
+ 
++	// Boundary termination from this point on ends the WebSocket with an
++	// application-private close code, so the client can tell "read-only mode
++	// revoked this terminal" (4003 + reason text) from a dropped connection
++	// (abnormal closure 1006, no close frame). WriteControl is safe to run
++	// concurrently with the output pump; closing the underlying transport
++	// (instead of ws.Close) avoids queuing a second, generic close frame.
++	bindCloser := func(conn io.Closer) {
++		sess.Bind(func(reason execsession.Reason) {
++			code, text := execsession.CloseFrame(reason)
++			if writeErr := ws.WriteControl(
++				websocket.CloseMessage,
++				websocket.FormatCloseMessage(code, text),
++				time.Now().Add(closeControlWait),
++			); writeErr != nil {
++				log.Printf("failed to send terminal close frame: %v", writeErr)
++			}
++			_ = ws.UnderlyingConn().Close()
++			if conn != nil {
++				_ = conn.Close()
++			}
++		})
++	}
++	bindCloser(nil)
++
+ 	ctx := r.Context()
+ 
+ 	execID, resp, err := ar.startExecSession(ctx, host, id)
+@@ -70,6 +112,11 @@ func (ar *APIRouter) HandleTerminal(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	defer resp.Close()
+ 
++	sess.SetExecID(execID)
++	// Replacing the binding adds the hijacked Docker connection to the teardown,
++	// which unblocks the output pump and detaches the container stream.
++	bindCloser(resp.Conn)
++
+ 	// Exec sessions grant shell access inside containers - audit them.
+ 	user := execAuditUser(r)
+ 	start := time.Now()
+diff --git a/server/internal/docker/exec.go b/server/internal/docker/exec.go
+index 96a86a3..9fd13f8 100644
+--- a/server/internal/docker/exec.go
++++ b/server/internal/docker/exec.go
+@@ -91,7 +91,11 @@ func (c *MultiHostClient) ResizeExec(ctx context.Context, host, execID string, h
+ // from the daemon rather than being scraped from shell output. The command runs
+ // to completion; the caller bounds it with ctx. Each stream keeps at most
+ // maxExecOutput bytes, and truncated reports when either was cut.
+-func (c *MultiHostClient) RunExec(ctx context.Context, host, containerID string, cmd []string) (stdout, stderr string, exitCode int, truncated bool, err error) {
++//
++// onExec, when non-nil, is invoked with the daemon-side exec id as soon as the
++// exec has been created, so the caller can register it for termination while
++// the command is still starting.
++func (c *MultiHostClient) RunExec(ctx context.Context, host, containerID string, cmd []string, onExec func(execID string)) (stdout, stderr string, exitCode int, truncated bool, err error) {
+ 	cli, err := c.GetClient(host)
+ 	if err != nil {
+ 		return "", "", 0, false, err
+@@ -105,6 +109,9 @@ func (c *MultiHostClient) RunExec(ctx context.Context, host, containerID string,
+ 	if err != nil {
+ 		return "", "", 0, false, fmt.Errorf("failed to create exec: %w", err)
+ 	}
++	if onExec != nil {
++		onExec(created.ID)
++	}
+ 
+ 	attach, err := cli.ContainerExecAttach(ctx, created.ID, container.ExecStartOptions{})
+ 	if err != nil {
+diff --git a/server/internal/execsession/supervisor.go b/server/internal/execsession/supervisor.go
+new file mode 100644
+index 0000000..ef33ef4
+--- /dev/null
++++ b/server/internal/execsession/supervisor.go
+@@ -0,0 +1,416 @@
++// Package execsession turns the read-only switch into an observable execution
++// boundary: it admits or rejects new terminal/exec sessions, tracks every
++// running Docker exec, and terminates them when the instance enters read-only
++// mode or shuts down.
++//
++// The package is transport-agnostic. Each session carries a terminate callback
++// supplied by its owner (the HTTP handlers); the callback closes the WebSocket
++// with a distinguishable close frame, tears down the hijacked Docker
++// connection, or cancels a one-shot command. Owners MUST call Release when the
++// session ends for any reason so the registry entry and the underlying
++// resources are freed.
++package execsession
++
++import (
++	"errors"
++	"log/slog"
++	"sync"
++	"sync/atomic"
++	"time"
++)
++
++// ErrNotReadOnly is returned by RetryCleanup when the instance is writable.
++var ErrNotReadOnly = errors.New("instance is not in read-only mode")
++
++// Kind distinguishes interactive terminals from one-shot commands.
++type Kind string
++
++const (
++	KindTerminal Kind = "terminal"
++	KindCommand  Kind = "command"
++)
++
++// Reason explains why a session is terminated, so callers can tell a
++// read-only revocation apart from a shutdown or an ordinary client disconnect.
++type Reason string
++
++const (
++	ReasonReadOnly Reason = "read_only"
++	ReasonShutdown Reason = "server_shutdown"
++)
++
++// WebSocket close codes in the 4000-4999 application-private range (RFC 6455).
++// A network drop produces no close frame at all (browser code 1006), so these
++// codes let clients distinguish a deliberate boundary close from a broken
++// connection.
++const (
++	CloseCodeReadOnly = 4003
++	CloseCodeShutdown = 4000
++)
++
++const (
++	CloseTextReadOnly = "instance entered read-only mode"
++	CloseTextShutdown = "server is shutting down"
++)
++
++// CloseFrame maps a termination reason to the WebSocket close code and text.
++func CloseFrame(reason Reason) (code int, text string) {
++	switch reason {
++	case ReasonShutdown:
++		return CloseCodeShutdown, CloseTextShutdown
++	default:
++		return CloseCodeReadOnly, CloseTextReadOnly
++	}
++}
++
++// PendingItem describes a session that termination was requested for but which
++// had not released its resources when the bounded cleanup wait elapsed. These
++// items stay tracked, keep blocking nothing new (admission is sealed), and can
++// be retried.
++type PendingItem struct {
++	ID        string    `json:"id"`
++	Kind      string    `json:"kind"`
++	Host      string    `json:"host"`
++	Container string    `json:"container"`
++	ExecID    string    `json:"execId,omitempty"`
++	StartedAt time.Time `json:"startedAt"`
++	Reason    string    `json:"reason"`
++}
++
++// Report is the observable result of a cleanup pass.
++type Report struct {
++	// Terminated counts sessions that released within the wait budget.
++	Terminated int `json:"terminated"`
++	// Pending lists sessions still holding resources after the wait.
++	Pending []PendingItem `json:"pending"`
++	// TimedOut is true when at least one session outlived the wait budget.
++	TimedOut bool `json:"timedOut"`
++}
++
++// Session is one admitted terminal or one-shot command.
++type Session struct {
++	ID        string
++	Kind      Kind
++	Host      string
++	Container string
++	StartedAt time.Time
++
++	execID atomic.Pointer[string]
++
++	supervisor *Supervisor
++	done       chan struct{}
++
++	mu         sync.Mutex
++	terminate  func(Reason)
++	terminated bool
++	reason     Reason
++
++	releaseOnce sync.Once
++}
++
++// SetExecID records the Docker exec id once it has been created, so cleanup
++// reports can name the exact daemon-side exec.
++func (s *Session) SetExecID(id string) {
++	s.execID.Store(&id)
++}
++
++// ExecID returns the recorded Docker exec id, or "" before creation.
++func (s *Session) ExecID() string {
++	if p := s.execID.Load(); p != nil {
++		return *p
++	}
++	return ""
++}
++
++// Bind installs (or replaces) the terminate callback. When termination has
++// already been requested before the callback existed, the callback is invoked
++// immediately with that reason, so a resource created during the switch still
++// gets torn down.
++func (s *Session) Bind(fn func(Reason)) {
++	s.mu.Lock()
++	if !s.terminated {
++		s.terminate = fn
++		s.mu.Unlock()
++		return
++	}
++	reason := s.reason
++	// Keep the newest callback installed; previously installed callbacks have
++	// already been invoked by Terminate.
++	s.terminate = fn
++	s.mu.Unlock()
++	fn(reason)
++}
++
++// Terminate requests termination exactly once, regardless of how many times
++// or from whom it is called (read-only switch, shutdown, later retry).
++func (s *Session) Terminate(reason Reason) {
++	s.mu.Lock()
++	if s.terminated {
++		s.mu.Unlock()
++		return
++	}
++	s.terminated = true
++	s.reason = reason
++	fn := s.terminate
++	s.mu.Unlock()
++	if fn != nil {
++		fn(reason)
++	}
++}
++
++// TerminationCause reports why the session was terminated, if it was. Callers
++// use it to answer clients with a revocation result instead of a generic error.
++func (s *Session) TerminationCause() (Reason, bool) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.reason, s.terminated
++}
++
++// Done closes when Release has run.
++func (s *Session) Done() <-chan struct{} { return s.done }
++
++func (s *Session) released() bool {
++	select {
++	case <-s.done:
++		return true
++	default:
++		return false
++	}
++}
++
++// Release unregisters the session. It is safe to call repeatedly and from any
++// goroutine; owners defer it so client disconnect, handler errors, hot-swaps
++// and shutdown all free the registry entry.
++func (s *Session) Release() {
++	s.releaseOnce.Do(func() {
++		s.supervisor.remove(s.ID)
++		close(s.done)
++	})
++}
++
++// Supervisor is the admission gate and the live registry of exec sessions.
++type Supervisor struct {
++	// transMu serializes enable/disable transitions, so a concurrent toggle
++	// cannot interleave seal/persist/cleanup with the opposite direction.
++	transMu sync.Mutex
++
++	mu       sync.Mutex
++	sealed   bool
++	sessions map[string]*Session
++	nextID   atomic.Uint64
++}
++
++// New creates a supervisor. initiallyReadOnly must reflect the effective
++// startup config: an instance booted under READONLY_MODE starts sealed, so new
++// sessions are refused without needing a transition.
++func New(startupReadOnly bool) *Supervisor {
++	return &Supervisor{
++		sealed:   startupReadOnly,
++		sessions: make(map[string]*Session),
++	}
++}
++
++// IsSealed reports whether new exec sessions must be refused. Read by the
++// read-only middleware on every request.
++func (s *Supervisor) IsSealed() bool {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.sealed
++}
++
++// Admit registers a new session. It returns nil while sealed (read-only entry
++// in progress or active), which the owner turns into a 403 before hijacking
++// the connection or creating any Docker exec.
++func (s *Supervisor) Admit(kind Kind, host, container string) *Session {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.sealed {
++		return nil
++	}
++	idNum := s.nextID.Add(1)
++	id := ""
++	switch kind {
++	case KindTerminal:
++		id = "terminal-"
++	default:
++		id = "command-"
++	}
++	id += uintToString(idNum)
++	sess := &Session{
++		ID:         id,
++		Kind:       kind,
++		Host:       host,
++		Container:  container,
++		StartedAt:  time.Now(),
++		supervisor: s,
++		done:       make(chan struct{}),
++	}
++	s.sessions[id] = sess
++	return sess
++}
++
++// Transition drives one read-only toggle, serialized against other toggles.
++//
++// Entering seals admission first, then calls persist: a persistence failure
++// rolls the seal back and never touches existing sessions. After a successful
++// persist every live session is terminated, and the call waits up to timeout
++// for their release; leftovers are reported, stay tracked and remain retryable
++// while admission stays sealed.
++//
++// Exiting persists first and only unseals on success, so a failed write keeps
++// the instance read-only. Sessions terminated by the prior entry stay dead;
++// unsealing admits only brand-new sessions.
++//
++// Same-direction calls are idempotent: persist still runs (preserving the
++// legacy file-rewrite behavior), and re-entering re-attempts leftover cleanup.
++func (s *Supervisor) Transition(enter bool, persist func() error, timeout time.Duration) (Report, error) {
++	s.transMu.Lock()
++	defer s.transMu.Unlock()
++
++	sealed := s.IsSealed()
++	switch {
++	case enter && !sealed:
++		s.setSealed(true)
++		if err := persist(); err != nil {
++			// Config did not change: reopen admission and leave sessions alone.
++			s.setSealed(false)
++			return Report{}, err
++		}
++		return s.cleanup(ReasonReadOnly, timeout), nil
++	case enter:
++		// Already read-only: persist keeps the legacy rewrite semantics and
++		// cleanup retries whatever a previous pass could not finish.
++		if err := persist(); err != nil {
++			return Report{}, err
++		}
++		return s.cleanup(ReasonReadOnly, timeout), nil
++	case !enter && sealed:
++		if err := persist(); err != nil {
++			// Stay sealed on a write failure rather than masking the risk.
++			return Report{}, err
++		}
++		s.setSealed(false)
++		return Report{}, nil
++	default:
++		// Writable -> writable: nothing to seal or clean up.
++		return Report{}, persist()
++	}
++}
++
++// RetryCleanup re-attempts termination of leftover sessions while read-only.
++// It fails when the instance is no longer sealed, so callers cannot use it to
++// interfere with sessions admitted after switching back to writable.
++func (s *Supervisor) RetryCleanup(timeout time.Duration) (Report, error) {
++	s.transMu.Lock()
++	defer s.transMu.Unlock()
++	if !s.IsSealed() {
++		return Report{}, ErrNotReadOnly
++	}
++	return s.cleanup(ReasonReadOnly, timeout), nil
++}
++
++// Shutdown terminates every live session with the shutdown reason and waits
++// bounded time for the underlying connections and commands to release.
++func (s *Supervisor) Shutdown(timeout time.Duration) Report {
++	s.transMu.Lock()
++	defer s.transMu.Unlock()
++	return s.cleanup(ReasonShutdown, timeout)
++}
++
++// Pending returns the sessions still holding resources. The settings API
++// exposes these while read-only so operators can see partial cleanup failures
++// and retry them.
++func (s *Supervisor) Pending() []PendingItem {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	items := make([]PendingItem, 0, len(s.sessions))
++	for _, sess := range s.sessions {
++		items = append(items, pendingItem(sess))
++	}
++	return items
++}
++
++// cleanup fans termination out to every tracked session, then bounds the wait
++// for their release by the overall timeout. Callers must hold transMu.
++func (s *Supervisor) cleanup(reason Reason, timeout time.Duration) Report {
++	s.mu.Lock()
++	snap := make([]*Session, 0, len(s.sessions))
++	for _, sess := range s.sessions {
++		snap = append(snap, sess)
++	}
++	s.mu.Unlock()
++
++	for _, sess := range snap {
++		sess.Terminate(reason)
++	}
++	if len(snap) > 0 {
++		slog.Info("read-only boundary: terminating exec sessions",
++			"reason", string(reason), "sessions", len(snap))
++	}
++
++	deadline := time.Now().Add(timeout)
++	pending := make([]PendingItem, 0)
++	for _, sess := range snap {
++		wait := time.Until(deadline)
++		if wait < 0 {
++			wait = 0
++		}
++		select {
++		case <-sess.Done():
++		case <-time.After(wait):
++		}
++		if !sess.released() {
++			pending = append(pending, pendingItem(sess))
++		}
++	}
++
++	report := Report{
++		Terminated: len(snap) - len(pending),
++		Pending:    pending,
++		TimedOut:   len(pending) > 0,
++	}
++	if report.TimedOut {
++		slog.Warn("read-only boundary: some exec sessions did not release in time",
++			"reason", string(reason), "terminated", report.Terminated, "pending", len(pending))
++	}
++	return report
++}
++
++func pendingItem(sess *Session) PendingItem {
++	reason, _ := sess.TerminationCause()
++	return PendingItem{
++		ID:        sess.ID,
++		Kind:      string(sess.Kind),
++		Host:      sess.Host,
++		Container: sess.Container,
++		ExecID:    sess.ExecID(),
++		StartedAt: sess.StartedAt,
++		Reason:    string(reason),
++	}
++}
++
++func (s *Supervisor) setSealed(sealed bool) {
++	s.mu.Lock()
++	s.sealed = sealed
++	s.mu.Unlock()
++}
++
++func (s *Supervisor) remove(id string) {
++	s.mu.Lock()
++	delete(s.sessions, id)
++	s.mu.Unlock()
++}
++
++func uintToString(n uint64) string {
++	if n == 0 {
++		return "0"
++	}
++	var buf [20]byte
++	i := len(buf)
++	for n > 0 {
++		i--
++		buf[i] = byte('0' + n%10)
++		n /= 10
++	}
++	return string(buf[i:])
++}
+diff --git a/server/internal/execsession/supervisor_test.go b/server/internal/execsession/supervisor_test.go
+new file mode 100644
+index 0000000..98bd2e9
+--- /dev/null
++++ b/server/internal/execsession/supervisor_test.go
+@@ -0,0 +1,353 @@
++package execsession
++
++import (
++	"errors"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func newReleasingSession(s *Supervisor, kind Kind) *Session {
++	sess := s.Admit(kind, "host-1", "ctr-1")
++	if sess == nil {
++		return nil
++	}
++	sess.Bind(func(Reason) { sess.Release() })
++	return sess
++}
++
++func TestAdmitAndRelease(t *testing.T) {
++	s := New(false)
++	sess := s.Admit(KindTerminal, "h", "c")
++	if sess == nil {
++		t.Fatal("admission should be open in writable mode")
++	}
++	if sess.ID == "" || sess.Kind != KindTerminal {
++		t.Fatalf("session not registered properly: %+v", sess)
++	}
++	if got := len(s.Pending()); got != 1 {
++		t.Fatalf("Pending = %d sessions, want 1", got)
++	}
++
++	sess.Release()
++	sess.Release() // idempotent
++	if len(s.Pending()) != 0 {
++		t.Fatal("Release did not unregister the session")
++	}
++	select {
++	case <-sess.Done():
++	default:
++		t.Fatal("Done channel not closed after Release")
++	}
++}
++
++func TestStartsSealedWhenBootingReadOnly(t *testing.T) {
++	s := New(true)
++	if !s.IsSealed() {
++		t.Fatal("env-locked read-only startup must seal admission")
++	}
++	if sess := s.Admit(KindTerminal, "h", "c"); sess != nil {
++		t.Fatal("admission must be refused while sealed")
++	}
++}
++
++func TestTransitionEnterSealsAndTerminates(t *testing.T) {
++	s := New(false)
++	sess := s.Admit(KindTerminal, "h", "c")
++	sess.SetExecID("exec-abc")
++	var gotReason Reason
++	sess.Bind(func(r Reason) {
++		gotReason = r
++		sess.Release()
++	})
++
++	var persisted atomic.Bool
++	report, err := s.Transition(true, func() error {
++		// Admission must already be sealed while persist runs.
++		if !s.IsSealed() {
++			t.Error("admission was not sealed before persist")
++		}
++		if s.Admit(KindCommand, "h", "c") != nil {
++			t.Error("new session admitted during transition")
++		}
++		persisted.Store(true)
++		return nil
++	}, time.Second)
++	if err != nil {
++		t.Fatalf("Transition: %v", err)
++	}
++	if !persisted.Load() || !s.IsSealed() {
++		t.Fatal("not persisted/sealed after enter")
++	}
++	if gotReason != ReasonReadOnly {
++		t.Fatalf("terminate reason = %q, want read_only", gotReason)
++	}
++	if report.Terminated != 1 || len(report.Pending) != 0 || report.TimedOut {
++		t.Fatalf("unexpected report: %+v", report)
++	}
++	if len(s.Pending()) != 0 {
++		t.Fatal("released session still tracked")
++	}
++	if s.Admit(KindTerminal, "h", "c") != nil {
++		t.Fatal("new session admitted after read-only entry")
++	}
++}
++
++func TestTransitionEnterPersistFailureRollsBack(t *testing.T) {
++	s := New(false)
++	sess := s.Admit(KindTerminal, "h", "c")
++	var terminated atomic.Bool
++	sess.Bind(func(Reason) { terminated.Store(true) })
++
++	wantErr := errors.New("disk full")
++	report, err := s.Transition(true, func() error { return wantErr }, time.Second)
++	if !errors.Is(err, wantErr) {
++		t.Fatalf("err = %v, want %v", err, wantErr)
++	}
++	if s.IsSealed() {
++		t.Fatal("seal must roll back after persistence failure")
++	}
++	if terminated.Load() {
++		t.Fatal("existing sessions must not be touched when persistence fails")
++	}
++	if report.Terminated != 0 {
++		t.Fatalf("report should be empty on rollback, got %+v", report)
++	}
++	if s.Admit(KindCommand, "h", "c") == nil {
++		t.Fatal("admission must reopen after rollback")
++	}
++}
++
++func TestTransitionEnterTimeoutReportsPendingAndStaysSealed(t *testing.T) {
++	s := New(false)
++	stuck := s.Admit(KindCommand, "h", "c")
++	stuck.SetExecID("exec-stuck")
++	// Termination fires but the session never releases (unresponsive daemon).
++	stuck.Bind(func(Reason) {})
++	free := newReleasingSession(s, KindTerminal)
++	if free == nil {
++		t.Fatal("could not admit second session")
++	}
++
++	report, err := s.Transition(true, func() error { return nil }, 25*time.Millisecond)
++	if err != nil {
++		t.Fatalf("Transition: %v", err)
++	}
++	if !s.IsSealed() {
++		t.Fatal("partial cleanup must not reopen writable mode")
++	}
++	if report.Terminated != 1 || !report.TimedOut || len(report.Pending) != 1 {
++		t.Fatalf("report = %+v, want 1 terminated and 1 pending", report)
++	}
++	p := report.Pending[0]
++	if p.ID != stuck.ID || p.ExecID != "exec-stuck" || p.Kind != "command" ||
++		p.Host != "h" || p.Container != "c" || p.Reason != "read_only" {
++		t.Fatalf("pending item mismatch: %+v", p)
++	}
++}
++
++func TestRetryCleanupFinishesLeftovers(t *testing.T) {
++	s := New(false)
++	stuck := s.Admit(KindTerminal, "h", "c")
++	stuck.Bind(func(Reason) {})
++
++	report, _ := s.Transition(true, func() error { return nil }, 10*time.Millisecond)
++	if !report.TimedOut {
++		t.Fatal("expected timed-out first pass")
++	}
++
++	if _, err := s.RetryCleanup(time.Second); err != nil {
++		t.Fatalf("retry while sealed: %v", err)
++	}
++	// Still stuck: pending remains.
++	if r, _ := s.RetryCleanup(10 * time.Millisecond); !r.TimedOut {
++		t.Fatal("retry must keep reporting the unresponsive session")
++	}
++
++	stuck.Release()
++	report, err := s.RetryCleanup(time.Second)
++	if err != nil {
++		t.Fatalf("retry: %v", err)
++	}
++	// Release unregistered the session before this pass, so the report counts
++	// no work of its own — the empty pending list is the all-clear signal.
++	if report.TimedOut || len(report.Pending) != 0 {
++		t.Fatalf("retry report = %+v, want an empty pending list", report)
++	}
++	if len(s.Pending()) != 0 {
++		t.Fatal("leftover still tracked after release")
++	}
++}
++
++func TestRetryCleanupRejectedWhenWritable(t *testing.T) {
++	s := New(false)
++	if _, err := s.RetryCleanup(time.Second); !errors.Is(err, ErrNotReadOnly) {
++		t.Fatalf("err = %v, want ErrNotReadOnly", err)
++	}
++}
++
++func TestTransitionExitPersistFirstThenUnseal(t *testing.T) {
++	s := New(false)
++	old := newReleasingSession(s, KindTerminal)
++	if _, err := s.Transition(true, func() error { return nil }, time.Second); err != nil {
++		t.Fatal(err)
++	}
++
++	// Persist failure keeps read-only in force.
++	if _, err := s.Transition(false, func() error { return errors.New("disk") }, time.Second); err == nil {
++		t.Fatal("exit persist failure must surface")
++	}
++	if !s.IsSealed() {
++		t.Fatal("failed exit persist must stay sealed")
++	}
++
++	if _, err := s.Transition(false, func() error { return nil }, time.Second); err != nil {
++		t.Fatal(err)
++	}
++	if s.IsSealed() {
++		t.Fatal("not unsealed after exit")
++	}
++	fresh := s.Admit(KindTerminal, "h", "c")
++	if fresh == nil {
++		t.Fatal("new sessions must work after switching back to writable")
++	}
++	fresh.Release()
++
++	// The old session must not revive.
++	select {
++	case <-old.Done():
++	default:
++		t.Fatal("terminated old session reopened")
++	}
++	if reason, ok := old.TerminationCause(); !ok || reason != ReasonReadOnly {
++		t.Fatalf("old session cause = %v/%v", reason, ok)
++	}
++}
++
++func TestIdempotentReEnterRetriesCleanup(t *testing.T) {
++	s := New(false)
++	stuck := s.Admit(KindCommand, "h", "c")
++	stuck.Bind(func(Reason) {})
++
++	if _, err := s.Transition(true, func() error { return nil }, 10*time.Millisecond); err != nil {
++		t.Fatal(err)
++	}
++	stuck.Release()
++
++	var persistCalls atomic.Int32
++	report, err := s.Transition(true, func() error { persistCalls.Add(1); return nil }, time.Second)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if persistCalls.Load() != 1 {
++		t.Fatal("same-direction enter must still persist")
++	}
++	if report.TimedOut || len(report.Pending) != 0 {
++		t.Fatalf("re-entering should finish leftover cleanup: %+v", report)
++	}
++}
++
++func TestBindFiresImmediatelyAfterTermination(t *testing.T) {
++	s := New(false)
++	sess := s.Admit(KindTerminal, "h", "c")
++	sess.Terminate(ReasonReadOnly) // no callback bound yet
++
++	var fired atomic.Bool
++	sess.Bind(func(r Reason) {
++		if r != ReasonReadOnly {
++			t.Errorf("reason = %q", r)
++		}
++		fired.Store(true)
++	})
++	if !fired.Load() {
++		t.Fatal("late Bind must invoke the callback with the recorded reason")
++	}
++
++	// The callback runs exactly once even with repeated termination.
++	sess.Terminate(ReasonShutdown)
++	sess.Terminate(ReasonReadOnly)
++	sess.Release()
++}
++
++func TestShutdownUsesDistinctReasonAndKeepsSealState(t *testing.T) {
++	s := New(true)
++	var reason Reason
++	sess := s.Admit(KindTerminal, "h", "c") // sealed: nil
++	if sess != nil {
++		t.Fatal("sealed supervisor admitted a session")
++	}
++	free := New(false)
++	s2 := free.Admit(KindCommand, "h", "c")
++	s2.Bind(func(r Reason) {
++		reason = r
++		s2.Release()
++	})
++	report := free.Shutdown(time.Second)
++	if report.Terminated != 1 || report.TimedOut {
++		t.Fatalf("shutdown report = %+v", report)
++	}
++	if reason != ReasonShutdown {
++		t.Fatalf("shutdown reason = %q", reason)
++	}
++	if free.IsSealed() {
++		t.Fatal("shutdown must not seal a writable instance")
++	}
++	if !s.IsSealed() {
++		t.Fatal("shutdown must not unseal a read-only instance")
++	}
++}
++
++func TestConcurrentTogglesEndConsistent(t *testing.T) {
++	s := New(false)
++	var stored atomic.Bool
++	persist := func(v bool) func() error {
++		return func() error {
++			stored.Store(v)
++			return nil
++		}
++	}
++
++	var wg sync.WaitGroup
++	for range 20 {
++		wg.Add(2)
++		go func() { defer wg.Done(); _, _ = s.Transition(true, persist(true), time.Second) }()
++		go func() { defer wg.Done(); _, _ = s.Transition(false, persist(false), time.Second) }()
++	}
++	wg.Wait()
++
++	if s.IsSealed() != stored.Load() {
++		t.Fatalf("seal = %v diverged from persisted value %v", s.IsSealed(), stored.Load())
++	}
++}
++
++func TestTerminateRaceWithReleasingSessions(t *testing.T) {
++	s := New(false)
++	const n = 50
++	sessions := make([]*Session, n)
++	for i := range n {
++		sess := s.Admit(KindTerminal, "h", "c")
++		sess.Bind(func(Reason) { sess.Release() })
++		sessions[i] = sess
++	}
++
++	done := make(chan Report, 1)
++	go func() {
++		r, _ := s.Transition(true, func() error { return nil }, 5*time.Second)
++		done <- r
++	}()
++
++	report := <-done
++	if report.Terminated != n || report.TimedOut {
++		t.Fatalf("report = %+v, want %d terminated", report, n)
++	}
++}
++
++func TestCloseFrameCodes(t *testing.T) {
++	if code, _ := CloseFrame(ReasonReadOnly); code != CloseCodeReadOnly {
++		t.Errorf("read-only code = %d", code)
++	}
++	if code, _ := CloseFrame(ReasonShutdown); code != CloseCodeShutdown {
++		t.Errorf("shutdown code = %d", code)
++	}
++}

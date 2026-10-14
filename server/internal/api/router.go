@@ -10,6 +10,7 @@ import (
 	"github.com/AmoabaKelvin/logdeck/internal/api/middleware"
 	"github.com/AmoabaKelvin/logdeck/internal/auth"
 	"github.com/AmoabaKelvin/logdeck/internal/config"
+	"github.com/AmoabaKelvin/logdeck/internal/execsession"
 	"github.com/AmoabaKelvin/logdeck/internal/logstore"
 	"github.com/AmoabaKelvin/logdeck/internal/services"
 	"github.com/AmoabaKelvin/logdeck/internal/static"
@@ -19,10 +20,11 @@ import (
 )
 
 type APIRouter struct {
-	router   *chi.Mux
-	registry *services.Registry
-	manager  *config.Manager
-	engine   *alerts.Engine
+	router       *chi.Mux
+	registry     *services.Registry
+	manager      *config.Manager
+	engine       *alerts.Engine
+	execSessions *execsession.Supervisor
 	// logStore is nil when log persistence is disabled or unusable.
 	logStore *logstore.Store
 	version  string
@@ -32,17 +34,26 @@ type APIRouter struct {
 	machineHostname   string
 }
 
-func NewRouter(registry *services.Registry, manager *config.Manager, engine *alerts.Engine, logStore *logstore.Store, version string) *chi.Mux {
+func NewRouter(registry *services.Registry, manager *config.Manager, engine *alerts.Engine, execSessions *execsession.Supervisor, logStore *logstore.Store, version string) *chi.Mux {
 	r := &APIRouter{
-		router:   chi.NewRouter(),
-		registry: registry,
-		manager:  manager,
-		engine:   engine,
-		logStore: logStore,
-		version:  version,
+		router:       chi.NewRouter(),
+		registry:     registry,
+		manager:      manager,
+		engine:       engine,
+		execSessions: execSessions,
+		logStore:     logStore,
+		version:      version,
 	}
 
 	return r.Routes()
+}
+
+// readOnlyAdmission is the single predicate every mutating route consults: it
+// is true for persisted read-only mode (file or env, hot-reloaded through the
+// registry config) and during the sealing window of a read-only transition,
+// before the config remerge lands.
+func (ar *APIRouter) readOnlyAdmission() bool {
+	return ar.registry.Config().ReadOnly || ar.execSessions.IsSealed()
 }
 
 func WriteJsonResponse(w http.ResponseWriter, status int, data any) {
@@ -133,9 +144,7 @@ func (ar *APIRouter) registerContainerRoutes(r chi.Router) {
 
 		// Mutating routes (blocked in read-only mode)
 		r.Group(func(mutating chi.Router) {
-			mutating.Use(middleware.ReadOnly(func() bool {
-				return ar.registry.Config().ReadOnly
-			}))
+			mutating.Use(middleware.ReadOnly(ar.readOnlyAdmission))
 			mutating.Post("/start", ar.StartContainer)
 			mutating.Post("/stop", ar.StopContainer)
 			mutating.Post("/restart", ar.RestartContainer)
@@ -164,7 +173,7 @@ func (ar *APIRouter) registerHistoryRoutes(r chi.Router) {
 	r.Get("/history/logs", ar.GetHistoryLogs)
 
 	destructive := r.With(
-		middleware.ReadOnly(func() bool { return ar.registry.Config().ReadOnly }),
+		middleware.ReadOnly(ar.readOnlyAdmission),
 		auth.DenyReadScope,
 	)
 	destructive.Delete("/history/containers", ar.DeleteHistoryAll)
@@ -185,12 +194,16 @@ func (ar *APIRouter) registerSettingsRoutes(r chi.Router) {
 		r.Put("/coolify-hosts", ar.UpdateCoolifyHosts)
 		r.Put("/dokploy-hosts", ar.UpdateDokployHosts)
 		r.Put("/read-only", ar.UpdateReadOnly)
+		// Retry tearing down exec sessions a previous read-only switch could
+		// not finish (e.g. an unresponsive daemon). Read-only stays in force
+		// until every session releases or the operator switches back.
+		r.Post("/read-only/cleanup", ar.RetryReadOnlyCleanup)
 		r.Put("/auth", ar.UpdateAuth)
 		// Lowering a retention cap makes the next janitor pass evict stored
 		// logs, so this route is blocked in read-only mode like the purge route
 		// — the other settings mutations touch no data and are not.
 		r.With(
-			middleware.ReadOnly(func() bool { return ar.registry.Config().ReadOnly }),
+			middleware.ReadOnly(ar.readOnlyAdmission),
 		).Put("/log-storage", ar.UpdateLogStorage)
 		r.Get("/api-tokens", ar.ListAPITokens)
 		r.Post("/api-tokens", ar.CreateAPIToken)

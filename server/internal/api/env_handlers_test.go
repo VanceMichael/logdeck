@@ -48,7 +48,7 @@ func envRouterWithEngine(t *testing.T, engine *httptest.Server, upstream http.Ha
 		t.Cleanup(platform.Close)
 		cc = coolify.NewMultiClient([]config.CoolifyHostConfig{{HostName: "local", APIURL: platform.URL, APIToken: "token"}})
 	}
-	ar := &APIRouter{registry: services.NewRegistry(dc, cc, nil, &config.Config{})}
+	ar := &APIRouter{registry: services.NewRegistry(dc, cc, nil, &config.Config{}), execSessions: testExecSupervisor()}
 	router := chi.NewRouter()
 	router.Route("/api/v1", ar.registerContainerRoutes)
 	return router

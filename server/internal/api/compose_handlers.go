@@ -16,9 +16,7 @@ var validComposeActions = map[string]bool{
 func (ar *APIRouter) registerComposeRoutes(r chi.Router) {
 	// Mutating routes (blocked in read-only mode)
 	r.Group(func(mutating chi.Router) {
-		mutating.Use(middleware.ReadOnly(func() bool {
-			return ar.registry.Config().ReadOnly
-		}))
+		mutating.Use(middleware.ReadOnly(ar.readOnlyAdmission))
 		mutating.Post("/compose/{project}/{action}", ar.ComposeAction)
 	})
 }

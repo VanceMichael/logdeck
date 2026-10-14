@@ -18,6 +18,7 @@ import {
 	type UpdateLogStoragePayload,
 	updateLogStorage,
 } from "../api/update-log-storage";
+import { retryReadOnlyCleanup } from "../api/retry-read-only-cleanup";
 import { updateReadOnly } from "../api/update-read-only";
 import type { APITokenScope } from "../types";
 
@@ -91,6 +92,18 @@ export function useUpdateReadOnly() {
 		onSuccess: () => {
 			queryClient.invalidateQueries({ queryKey: SETTINGS_KEY });
 			queryClient.invalidateQueries({ queryKey: CONTAINERS_KEY });
+		},
+	});
+}
+
+// Retry terminating exec sessions a read-only switch could not finish. The
+// instance stays read-only regardless of the outcome.
+export function useRetryReadOnlyCleanup() {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: retryReadOnlyCleanup,
+		onSettled: () => {
+			queryClient.invalidateQueries({ queryKey: SETTINGS_KEY });
 		},
 	});
 }

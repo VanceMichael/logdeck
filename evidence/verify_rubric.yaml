@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: terminal 与 /exec/run 共享活动 Docker exec 登记和只读切换闸门；开启只读时新 admission 被线性化拒绝，已接纳会话能被完整枚举。
+  - id: 2
+    type: f2p
+    text: 交互终端会终止对应 Docker exec，关闭 WebSocket 与 hijacked connection，并向客户端提供区别于普通断网的只读撤销原因；旧连接之后不会自动复活。
+  - id: 3
+    type: f2p
+    text: 正在执行的 run_command 会取消上下文、停止底层 exec 并返回明确的只读撤销结果，而不是继续到超时、伪装成普通 500 或返回成功。
+  - id: 4
+    type: f2p
+    text: 配置持久化失败不影响现有会话；持久化成功后的 daemon 超时或终止失败保持只读并返回可观察的部分清理结果，未清理项可重试且新命令持续被阻止。
+  - id: 5
+    type: f2p
+    text: 并发切换、客户端断开、Docker client 热交换与服务 shutdown 会按确定顺序注销会话并释放 cancel、exec、WebSocket 和 hijacked connection，不泄漏或误杀后来创建的会话。
+  - id: 6
+    type: p2p
+    text: 切回可写后新终端和新命令正常工作；环境变量锁定、普通容器读操作和没有活动 exec 时的设置行为保持兼容，前端不会把只读撤销当普通断线循环重连。
+  - id: 7
+    type: f2p
+    text: 自动化验证分别覆盖设置持久化失败、活动 terminal、活动 run_command、部分 daemon 失败、切回可写、client swap 和 shutdown 竞态，并证明每种外部结果可区分。

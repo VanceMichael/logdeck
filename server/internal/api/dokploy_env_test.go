@@ -55,7 +55,7 @@ func TestDokployMappingSaveAndDeploy(t *testing.T) {
 	}
 	defer func() { client, _ := dc.GetClient("local"); _ = client.Close() }()
 	cfg := &config.Config{DokployHosts: []config.DokployHostConfig{{HostName: "local", APIURL: platform.URL + "/api", APIToken: "token"}}}
-	ar := &APIRouter{registry: services.NewRegistry(dc, nil, nil, cfg)}
+	ar := &APIRouter{registry: services.NewRegistry(dc, nil, nil, cfg), execSessions: testExecSupervisor()}
 	router := chi.NewRouter()
 	router.Route("/api/v1", ar.registerContainerRoutes)
 	request := func(method, query, body string) *httptest.ResponseRecorder {

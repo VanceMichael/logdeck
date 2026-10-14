@@ -18,6 +18,7 @@ import (
 	"github.com/AmoabaKelvin/logdeck/internal/coolify"
 	"github.com/AmoabaKelvin/logdeck/internal/docker"
 	"github.com/AmoabaKelvin/logdeck/internal/dokploy"
+	"github.com/AmoabaKelvin/logdeck/internal/execsession"
 	"github.com/AmoabaKelvin/logdeck/internal/logstore"
 	"github.com/AmoabaKelvin/logdeck/internal/logstream"
 	"github.com/AmoabaKelvin/logdeck/internal/services"
@@ -76,6 +77,11 @@ func main() {
 
 	registry := services.NewRegistry(multiHostClient, coolifyClient, authService, cfg)
 
+	// The read-only execution boundary. It starts sealed when the instance
+	// boots under READONLY_MODE, and it owns the termination of live terminal
+	// and one-shot exec sessions on read-only entry and on shutdown.
+	execSupervisor := execsession.New(cfg.ReadOnly)
+
 	logHub := logstream.New(registry)
 	alertEngine := alerts.NewEngine(registry, manager, logHub)
 	// logStore is nil when persistence is disabled or its database is
@@ -114,7 +120,7 @@ func main() {
 		log.Println("Configuration reloaded successfully")
 	})
 
-	apiRouter := api.NewRouter(registry, manager, alertEngine, logStore, version)
+	apiRouter := api.NewRouter(registry, manager, alertEngine, execSupervisor, logStore, version)
 
 	// No WriteTimeout/IdleTimeout: log streaming and terminal WebSockets are
 	// long-lived connections and would be killed by them. ReadTimeout only
@@ -165,6 +171,14 @@ func main() {
 
 	<-ctx.Done()
 	log.Println("Shutting down server...")
+
+	// Close live terminal and one-shot exec sessions first: their hijacked
+	// connections are invisible to server.Shutdown, so ending them with the
+	// shutdown close code releases the registry entries and Docker streams
+	// before the HTTP server drains.
+	if report := execSupervisor.Shutdown(5 * time.Second); report.TimedOut {
+		log.Printf("Shutdown: %d exec session(s) did not release in time", len(report.Pending))
+	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

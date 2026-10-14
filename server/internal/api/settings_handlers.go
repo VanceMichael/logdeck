@@ -90,6 +90,17 @@ func (ar *APIRouter) GetSettings(w http.ResponseWriter, r *http.Request) {
 	logStore := ar.manager.LogStore()
 	logStoreSources := ar.manager.LogStoreSources()
 
+	// cleanupPending only has meaning while read-only; report an empty list
+	// once writable so fresh sessions are never mistaken for leftovers.
+	readOnlyBlock := map[string]any{
+		"source":         sources.ReadOnly,
+		"value":          cfg.ReadOnly,
+		"cleanupPending": []any{},
+	}
+	if cfg.ReadOnly {
+		readOnlyBlock["cleanupPending"] = ar.execSessions.Pending()
+	}
+
 	WriteJsonResponse(w, http.StatusOK, map[string]any{
 		"dockerHosts": map[string]any{
 			"source":   sources.DockerHosts,
@@ -116,11 +127,8 @@ func (ar *APIRouter) GetSettings(w http.ResponseWriter, r *http.Request) {
 			"hosts":    dokployHosts,
 			"revision": config.HostsRevision(cfg.DokployHosts),
 		},
-		"readOnly": map[string]any{
-			"source": sources.ReadOnly,
-			"value":  cfg.ReadOnly,
-		},
-		"auth": authResp,
+		"readOnly": readOnlyBlock,
+		"auth":     authResp,
 	})
 }
 
@@ -234,7 +242,20 @@ func (ar *APIRouter) UpdateCoolifyHosts(w http.ResponseWriter, r *http.Request) 
 	WriteJsonResponse(w, http.StatusOK, map[string]any{"message": "Coolify hosts updated"})
 }
 
+// readOnlyCleanupTimeout bounds how long the read-only switch waits for live
+// terminal and one-shot exec sessions to terminate and release. Sessions that
+// outlast it are reported in the response and stay retryable; the switch
+// itself never rolls back to writable because of them.
+const readOnlyCleanupTimeout = 10 * time.Second
+
 // UpdateReadOnly handles PUT /api/v1/settings/read-only.
+//
+// Enabling is an execution boundary: the supervisor seals new terminal and
+// exec admission first, the config is persisted next (a persistence failure
+// reopens admission and leaves existing sessions untouched), and only after
+// every tracked session terminates — or the bounded cleanup wait elapses with
+// the leftovers reported — does the response return. Disabling persists first
+// and unseals only on success, so a disk failure cannot silently reopen writes.
 func (ar *APIRouter) UpdateReadOnly(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Value bool `json:"value"`
@@ -244,12 +265,41 @@ func (ar *APIRouter) UpdateReadOnly(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := ar.manager.UpdateReadOnly(req.Value); err != nil {
+	report, err := ar.execSessions.Transition(req.Value, func() error {
+		return ar.manager.UpdateReadOnly(req.Value)
+	}, readOnlyCleanupTimeout)
+	if err != nil {
 		http.Error(w, err.Error(), settingsErrorStatus(err))
 		return
 	}
 
-	WriteJsonResponse(w, http.StatusOK, map[string]any{"message": "Read-only mode updated"})
+	response := map[string]any{
+		"message":  "Read-only mode updated",
+		"readOnly": req.Value,
+	}
+	// The cleanup report is additive: clients built for the old shape still
+	// see the message field. With no active execs it is simply an empty report,
+	// preserving the previous switching behavior.
+	if req.Value {
+		response["cleanup"] = report
+	}
+	WriteJsonResponse(w, http.StatusOK, response)
+}
+
+// RetryReadOnlyCleanup handles POST /api/v1/settings/read-only/cleanup: it
+// re-attempts termination of exec sessions a previous read-only entry could
+// not finish (for example an unresponsive Docker daemon). Read-only mode and
+// the admission seal stay in force regardless of the outcome.
+func (ar *APIRouter) RetryReadOnlyCleanup(w http.ResponseWriter, r *http.Request) {
+	report, err := ar.execSessions.RetryCleanup(readOnlyCleanupTimeout)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	WriteJsonResponse(w, http.StatusOK, map[string]any{
+		"readOnly": true,
+		"cleanup":  report,
+	})
 }
 
 // maxLogStoreMB bounds a retention cap at 1 TiB — far past any sensible SQLite

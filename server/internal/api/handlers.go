@@ -11,8 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AmoabaKelvin/logdeck/internal/api/middleware"
 	"github.com/AmoabaKelvin/logdeck/internal/auth"
 	"github.com/AmoabaKelvin/logdeck/internal/docker"
+	"github.com/AmoabaKelvin/logdeck/internal/execsession"
 	"github.com/AmoabaKelvin/logdeck/internal/models"
 	"github.com/AmoabaKelvin/logdeck/internal/system"
 	"github.com/docker/docker/api/types/container"
@@ -207,11 +209,36 @@ func (ar *APIRouter) RunCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Admission gate: refuse once the read-only boundary is sealing, before a
+	// Docker exec exists. The ReadOnly middleware covers the common path; this
+	// closes the race window between sealing and the config remerge.
+	sess := ar.execSessions.Admit(execsession.KindCommand, host, id)
+	if sess == nil {
+		middleware.Block(w)
+		return
+	}
+	defer sess.Release()
+
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
+	// Boundary termination cancels the command's context; RunExec then closes
+	// the hijacked connection and returns ctx.Err() instead of running to
+	// completion in the background.
+	sess.Bind(func(execsession.Reason) { cancel() })
 
-	stdout, stderr, exitCode, truncated, err := ar.registry.Docker().RunExec(ctx, host, id, []string{"/bin/sh", "-c", req.Command})
+	stdout, stderr, exitCode, truncated, err := ar.registry.Docker().RunExec(ctx, host, id, []string{"/bin/sh", "-c", req.Command}, sess.SetExecID)
 	if err != nil {
+		// A read-only revocation is a deliberate, structured conflict, not a
+		// daemon failure (500) or a dropped client connection (no response
+		// delivered), so callers can retry after the instance is writable again.
+		if reason, revoked := sess.TerminationCause(); revoked && reason == execsession.ReasonReadOnly {
+			WriteJsonResponse(w, http.StatusConflict, map[string]any{
+				"error":     "command revoked: the instance entered read-only mode",
+				"code":      "EXEC_REVOKED_READ_ONLY",
+				"read_only": true,
+			})
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

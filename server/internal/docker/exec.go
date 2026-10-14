@@ -91,7 +91,11 @@ func (c *MultiHostClient) ResizeExec(ctx context.Context, host, execID string, h
 // from the daemon rather than being scraped from shell output. The command runs
 // to completion; the caller bounds it with ctx. Each stream keeps at most
 // maxExecOutput bytes, and truncated reports when either was cut.
-func (c *MultiHostClient) RunExec(ctx context.Context, host, containerID string, cmd []string) (stdout, stderr string, exitCode int, truncated bool, err error) {
+//
+// onExec, when non-nil, is invoked with the daemon-side exec id as soon as the
+// exec has been created, so the caller can register it for termination while
+// the command is still starting.
+func (c *MultiHostClient) RunExec(ctx context.Context, host, containerID string, cmd []string, onExec func(execID string)) (stdout, stderr string, exitCode int, truncated bool, err error) {
 	cli, err := c.GetClient(host)
 	if err != nil {
 		return "", "", 0, false, err
@@ -104,6 +108,9 @@ func (c *MultiHostClient) RunExec(ctx context.Context, host, containerID string,
 	})
 	if err != nil {
 		return "", "", 0, false, fmt.Errorf("failed to create exec: %w", err)
+	}
+	if onExec != nil {
+		onExec(created.ID)
 	}
 
 	attach, err := cli.ContainerExecAttach(ctx, created.ID, container.ExecStartOptions{})

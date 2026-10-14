@@ -37,9 +37,28 @@ export interface CoolifyHostsConfig {
 	revision?: string;
 }
 
+/** A live exec session a read-only switch could not tear down in time. */
+export interface ReadOnlyCleanupPending {
+	id: string;
+	kind: "terminal" | "command";
+	host: string;
+	container: string;
+	execId?: string;
+	startedAt: string;
+	reason: string;
+}
+
+export interface ReadOnlyCleanupReport {
+	terminated: number;
+	timedOut: boolean;
+	pending: ReadOnlyCleanupPending[];
+}
+
 export interface ReadOnlyConfig {
 	source: ConfigSource;
 	value: boolean;
+	/** Sessions still holding Docker resources after the cleanup wait. */
+	cleanupPending?: ReadOnlyCleanupPending[];
 }
 
 export interface AuthConfig {
