@@ -11,6 +11,18 @@ export interface AlertDelivery {
 	error?: string;
 }
 
+// Per-channel outcome captured from the alert's trigger-time channel
+// snapshot. Targets and secrets are never included. Absent for history
+// entries written before per-channel tracking.
+export interface AlertChannelDelivery {
+	channelId: string;
+	channelName?: string;
+	channelType: string;
+	status: string;
+	httpStatus?: number;
+	error?: string;
+}
+
 export interface AlertHistoryEntry {
 	id: string;
 	ruleId: string;
@@ -25,6 +37,7 @@ export interface AlertHistoryEntry {
 	suppressed: number;
 	firedAt: string;
 	delivery?: AlertDelivery;
+	channels?: AlertChannelDelivery[];
 }
 
 export interface AlertHistoryResponse {

@@ -5,9 +5,12 @@
 // Concurrency model: a single run goroutine owns all mutable state (compiled
 // rules, subscription handles, rate/cooldown windows, the event-stream child
 // context). Log-rule sinks run on the hub's delivery goroutines and only push
-// non-blocking match messages onto firedCh. A single dispatcher goroutine
-// consumes fired alerts, appends them to history, delivers them to the
-// configured channels, and records each delivery outcome on the history entry.
+// non-blocking match messages onto firedCh. At the moment a rule fires, the
+// run goroutine captures an immutable snapshot of every enabled channel from
+// one config revision and enqueues it with the alert; a single dispatcher
+// goroutine appends alerts to history, fans them out to the snapshot channels
+// (concurrently, with one retry), and records the summary and per-channel
+// outcomes. Later channel edits never affect a queued or in-flight alert.
 // Helper goroutines exist only for single container-inspect lookups.
 package alerts
 
@@ -143,6 +146,17 @@ type inspectResult struct {
 	fire     bool
 }
 
+// dispatchItem is one fired alert paired with the immutable snapshot of the
+// channels enabled at its trigger linearization point. Queueing, fan-out,
+// retry and shutdown drain all read channels exclusively from this value
+// copy; the live config is never consulted again for this alert, so a
+// channel edited, disabled or deleted afterwards affects only future
+// triggers.
+type dispatchItem struct {
+	alert    models.Alert
+	channels []config.AlertChannel
+}
+
 // Engine evaluates alert rules against engine events and log records and
 // records fired alerts in an in-memory history.
 type Engine struct {
@@ -156,7 +170,7 @@ type Engine struct {
 	reconcileCh chan struct{}
 	firedCh     chan matchMsg
 	inspectCh   chan inspectResult
-	dispatchCh  chan models.Alert
+	dispatchCh  chan dispatchItem
 	flushStop   chan struct{}
 
 	// deliverCtx survives Start-context cancellation so in-flight deliveries
@@ -166,9 +180,10 @@ type Engine struct {
 	deliverCtx context.Context
 	skipRetry  <-chan struct{}
 
-	resyncInterval time.Duration
-	now            func() time.Time
-	wg             sync.WaitGroup
+	resyncInterval     time.Duration
+	shutdownDrain      time.Duration
+	now                func() time.Time
+	wg                 sync.WaitGroup
 
 	matchDrops  atomic.Uint64
 	loggedDrops uint64 // owned by the run loop
@@ -200,9 +215,10 @@ func newEngine(hub engineHub, source func() eventClient, alertsFn func() config.
 		reconcileCh:    make(chan struct{}, 1),
 		firedCh:        make(chan matchMsg, firedBuffer),
 		inspectCh:      make(chan inspectResult, inspectBuffer),
-		dispatchCh:     make(chan models.Alert, dispatchBuffer),
+		dispatchCh:     make(chan dispatchItem, dispatchBuffer),
 		flushStop:      make(chan struct{}),
 		resyncInterval: defaultResyncInterval,
+		shutdownDrain:  shutdownDrainBudget,
 		now:            time.Now,
 	}
 }
@@ -235,7 +251,7 @@ func (e *Engine) Start(ctx context.Context) {
 		defer e.wg.Done()
 		defer drainCancel()
 		<-ctx.Done()
-		timer := time.NewTimer(shutdownDrainBudget)
+		timer := time.NewTimer(e.shutdownDrain)
 		defer timer.Stop()
 		select {
 		case <-timer.C:
@@ -659,8 +675,18 @@ func (e *Engine) window(st *runState, key string, rule *compiledRule) *ruleWindo
 	return w
 }
 
-// emit builds the alert and hands it to the dispatcher without blocking the
-// run loop; a full dispatch queue drops the alert with a log line.
+// emit builds the alert, captures the immutable snapshot of every channel
+// enabled at this trigger's linearization point, and hands both to the
+// dispatcher without blocking the run loop; a full dispatch queue drops the
+// alert with a log line.
+//
+// The single alertsFn call reads one config revision atomically: the config
+// manager swaps the whole Alerts pointer under its write lock and never
+// mutates a channel slice in place, while the snapshot read takes the read
+// lock, so a trigger racing a channel save uses either the entire old
+// revision or the entire new one — never a mix across channels or retries.
+// A save whose persistence fails rolls the live pointer back, but cannot
+// touch a snapshot already detached here; pending plans are immutable.
 func (e *Engine) emit(rule *compiledRule, host, containerID, containerName, reason, sample string, suppressed int) {
 	alert := models.Alert{
 		ID:            newAlertID(),
@@ -676,8 +702,12 @@ func (e *Engine) emit(rule *compiledRule, host, containerID, containerName, reas
 		Suppressed:    suppressed,
 		FiredAt:       e.now().UTC().Format(time.RFC3339),
 	}
+	item := dispatchItem{
+		alert:    alert,
+		channels: enabledChannels(e.alertsFn().Channels),
+	}
 	select {
-	case e.dispatchCh <- alert:
+	case e.dispatchCh <- item:
 	default:
 		log.Printf("alerts: dispatch queue full, dropping alert %s (rule %q)", alert.ID, rule.name)
 	}
@@ -730,32 +760,56 @@ func (e *Engine) shutdownRun(st *runState) {
 	}
 }
 
-// dispatchLoop consumes fired alerts: each alert is appended to history first
-// (Delivery nil) so a hung channel can never lose it, then delivered to every
-// enabled channel (read live from config; no enabled channels means
-// history-only) and its history entry updated with the summary result. It exits
-// when the run loop closes dispatchCh, then stops the history flusher, which
-// performs the final synchronous flush. Once the shutdown drain budget has
-// expired, remaining alerts are recorded as failed ("shutdown") without a
-// delivery attempt.
+// dispatchLoop consumes fired alerts paired with their trigger-time channel
+// snapshot. Each alert is appended to history first (Delivery nil) so a hung
+// channel can never lose it, then delivered to every snapshot channel (a
+// snapshot with no enabled channels means history-only) and its history entry
+// updated with both the summary result and the per-channel outcomes. Live
+// channel configuration is never read here: queueing, fan-out, retry and this
+// loop use the snapshot exclusively. The loop exits when the run loop closes
+// dispatchCh, then stops the history flusher, which performs the final
+// synchronous flush. Once the shutdown drain budget has expired, remaining
+// alerts and their snapshot channels get a deterministic failed ("shutdown")
+// terminal state without a delivery attempt or a live-config read.
 func (e *Engine) dispatchLoop() {
 	defer close(e.flushStop)
-	for alert := range e.dispatchCh {
-		e.hist.append(alert)
-		channels := enabledChannels(e.alertsFn().Channels)
-		if len(channels) == 0 {
+	for item := range e.dispatchCh {
+		e.hist.append(item.alert)
+		// No channel was enabled at the trigger moment: history-only, keeping
+		// Delivery and Channels nil as in the legacy contract.
+		if len(item.channels) == 0 {
 			continue
 		}
 		var result models.DeliveryResult
+		var deliveries []models.ChannelDelivery
 		if e.deliverCtx.Err() != nil {
 			result = models.DeliveryResult{Status: "failed", Error: "shutdown"}
+			deliveries = shutdownChannelDeliveries(item.channels)
 		} else {
 			ctx, cancel := context.WithTimeout(e.deliverCtx, deliverBudget)
-			result = e.notif.deliverAll(ctx, channels, alert, e.skipRetry)
+			result, deliveries = e.notif.deliverAll(ctx, item.channels, item.alert, e.skipRetry)
 			cancel()
 		}
-		e.hist.setDelivery(alert.ID, result)
+		e.hist.setDelivery(item.alert.ID, result, deliveries)
 	}
+}
+
+// shutdownChannelDeliveries builds the terminal per-channel results recorded
+// when the shutdown drain budget expires before an alert can be attempted.
+// Channel identities come from the trigger-time snapshot; the live channel
+// configuration is deliberately not read.
+func shutdownChannelDeliveries(channels []config.AlertChannel) []models.ChannelDelivery {
+	deliveries := make([]models.ChannelDelivery, len(channels))
+	for i, ch := range channels {
+		deliveries[i] = models.ChannelDelivery{
+			ChannelID:   ch.ID,
+			ChannelName: ch.Name,
+			ChannelType: ch.Type,
+			Status:      "failed",
+			Error:       "shutdown",
+		}
+	}
+	return deliveries
 }
 
 // logReason renders the human-readable reason for a fired log rule, e.g.

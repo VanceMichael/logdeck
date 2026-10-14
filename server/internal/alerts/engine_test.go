@@ -589,11 +589,14 @@ func TestDispatchDisabledChannelSkipped(t *testing.T) {
 	te.hub.emit(record(models.LogLevelError, "boom"))
 
 	// The alert is recorded (history-only) but never delivered to the disabled
-	// channel, so its delivery stays nil.
+	// channel, so its delivery and per-channel results stay nil.
 	waitFor(t, "alert in history", func() bool { return len(te.e.History(0)) == 1 })
 	time.Sleep(50 * time.Millisecond)
 	if d := te.e.History(0)[0].Delivery; d != nil {
 		t.Fatalf("delivery = %+v, want nil (channel disabled)", d)
+	}
+	if chs := te.e.History(0)[0].Channels; len(chs) != 0 {
+		t.Fatalf("channels = %+v, want none (channel disabled)", chs)
 	}
 	if got := hits.Load(); got != 0 {
 		t.Fatalf("disabled channel received %d requests, want 0", got)

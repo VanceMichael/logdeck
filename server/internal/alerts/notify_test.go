@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -208,6 +209,64 @@ func TestDeliveryErrorRedactsTelegramToken(t *testing.T) {
 	}
 }
 
+// Slack/Discord-style webhook URLs embed the capability token in the path; a
+// network error echoes the full URL, so the path must be redacted before the
+// error reaches alert history.
+func TestDeliveryErrorRedactsWebhookURLSecret(t *testing.T) {
+	n := &notifier{client: &http.Client{Transport: failingRoundTripper{}}, retryDelay: 0}
+	ch := config.AlertChannel{ID: "c1", Type: "webhook", Enabled: true, URL: "https://hooks.example.com/services/T00/B00/secret-token"}
+
+	res := n.deliver(context.Background(), ch, testAlert(), nil)
+	if res.Status != "failed" {
+		t.Fatalf("status = %q, want failed", res.Status)
+	}
+	if strings.Contains(res.Error, "secret-token") || strings.Contains(res.Error, "/services/T00/B00/secret-token") {
+		t.Fatalf("delivery error leaked the webhook URL secret: %q", res.Error)
+	}
+	if !strings.Contains(res.Error, "***") {
+		t.Fatalf("expected the URL path to be redacted, got %q", res.Error)
+	}
+	// The host remains visible for diagnosis.
+	if !strings.Contains(res.Error, "hooks.example.com") {
+		t.Fatalf("redaction should keep the host, got %q", res.Error)
+	}
+}
+
+// The ntfy topic path acts as a capability for private topics and must be
+// redacted the same way.
+func TestDeliveryErrorRedactsNtfyTopic(t *testing.T) {
+	n := &notifier{client: &http.Client{Transport: failingRoundTripper{}}, retryDelay: 0}
+	ch := config.AlertChannel{ID: "c1", Type: "ntfy", Enabled: true, URL: "https://ntfy.example.com/private-topic?auth=secretquery"}
+
+	res := n.deliver(context.Background(), ch, testAlert(), nil)
+	if strings.Contains(res.Error, "private-topic") || strings.Contains(res.Error, "secretquery") {
+		t.Fatalf("delivery error leaked the ntfy topic/query: %q", res.Error)
+	}
+	if !strings.Contains(res.Error, "***") {
+		t.Fatalf("expected the topic path/query to be redacted, got %q", res.Error)
+	}
+}
+
+func TestURLSecret(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"slack path", "https://hooks.slack.com/services/T/B/X", "/services/T/B/X"},
+		{"host only", "https://example.com", ""},
+		{"root path", "https://example.com/", ""},
+		{"path and query", "https://e.com/t?x=1", "/t?x=1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := urlSecret(tc.raw); got != tc.want {
+				t.Fatalf("urlSecret(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDeliverAllSummarizesFailures(t *testing.T) {
 	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer okSrv.Close()
@@ -221,7 +280,7 @@ func TestDeliverAllSummarizesFailures(t *testing.T) {
 		{ID: "c2", Type: "webhook", Name: "bad", Enabled: true, URL: badSrv.URL},
 	}
 	n := newNotifier()
-	res := n.deliverAll(context.Background(), channels, testAlert(), nil)
+	res, perChannel := n.deliverAll(context.Background(), channels, testAlert(), nil)
 
 	if res.Status != "failed" {
 		t.Fatalf("status = %q, want failed", res.Status)
@@ -231,6 +290,13 @@ func TestDeliverAllSummarizesFailures(t *testing.T) {
 	}
 	if strings.Contains(res.Error, "good:") {
 		t.Fatalf("error %q should not list the succeeding channel", res.Error)
+	}
+	want := []models.ChannelDelivery{
+		{ChannelID: "c1", ChannelName: "good", ChannelType: "webhook", Status: "ok", HTTPStatus: http.StatusOK},
+		{ChannelID: "c2", ChannelName: "bad", ChannelType: "webhook", Status: "failed", HTTPStatus: http.StatusBadRequest, Error: "channel returned 400 Bad Request"},
+	}
+	if !reflect.DeepEqual(perChannel, want) {
+		t.Fatalf("per-channel results = %+v, want %+v", perChannel, want)
 	}
 }
 
@@ -243,13 +309,19 @@ func TestDeliverAllAllOK(t *testing.T) {
 		{ID: "c2", Type: "ntfy", Enabled: true, URL: srv.URL + "/t"},
 	}
 	n := newNotifier()
-	res := n.deliverAll(context.Background(), channels, testAlert(), nil)
+	res, perChannel := n.deliverAll(context.Background(), channels, testAlert(), nil)
 	if res.Status != "ok" {
 		t.Fatalf("result = %+v, want ok", res)
 	}
 	// HTTP status is only carried through for a single channel.
 	if res.HTTPStatus != 0 {
 		t.Fatalf("httpStatus = %d, want 0 for a multi-channel summary", res.HTTPStatus)
+	}
+	if len(perChannel) != 2 || perChannel[0].Status != "ok" || perChannel[1].Status != "ok" {
+		t.Fatalf("per-channel results = %+v, want both ok", perChannel)
+	}
+	if perChannel[0].ChannelID != "c1" || perChannel[1].ChannelID != "c2" {
+		t.Fatalf("per-channel results lost snapshot identity/order: %+v", perChannel)
 	}
 }
 

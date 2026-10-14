@@ -71,15 +71,16 @@ func (h *history) append(a models.Alert) {
 	h.dirty = true
 }
 
-// setDelivery records the delivery result on the entry with the given alert
-// ID and marks the store dirty. An ID that is no longer present (evicted past
-// the cap or cleared) is ignored.
-func (h *history) setDelivery(id string, result models.DeliveryResult) {
+// setDelivery records the summary result and per-channel outcomes on the
+// entry with the given alert ID and marks the store dirty. An ID that is no
+// longer present (evicted past the cap or cleared) is ignored.
+func (h *history) setDelivery(id string, result models.DeliveryResult, channels []models.ChannelDelivery) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for i := range h.entries {
 		if h.entries[i].ID == id {
 			h.entries[i].Delivery = &result
+			h.entries[i].Channels = channels
 			h.dirty = true
 			return
 		}

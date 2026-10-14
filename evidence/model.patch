@@ -1,0 +1,996 @@
+diff --git a/frontend/src/features/settings/api/get-alert-history.ts b/frontend/src/features/settings/api/get-alert-history.ts
+index 3ed196e..1d82f53 100644
+--- a/frontend/src/features/settings/api/get-alert-history.ts
++++ b/frontend/src/features/settings/api/get-alert-history.ts
+@@ -11,6 +11,18 @@ export interface AlertDelivery {
+ 	error?: string;
+ }
+ 
++// Per-channel outcome captured from the alert's trigger-time channel
++// snapshot. Targets and secrets are never included. Absent for history
++// entries written before per-channel tracking.
++export interface AlertChannelDelivery {
++	channelId: string;
++	channelName?: string;
++	channelType: string;
++	status: string;
++	httpStatus?: number;
++	error?: string;
++}
++
+ export interface AlertHistoryEntry {
+ 	id: string;
+ 	ruleId: string;
+@@ -25,6 +37,7 @@ export interface AlertHistoryEntry {
+ 	suppressed: number;
+ 	firedAt: string;
+ 	delivery?: AlertDelivery;
++	channels?: AlertChannelDelivery[];
+ }
+ 
+ export interface AlertHistoryResponse {
+diff --git a/server/internal/alerts/engine.go b/server/internal/alerts/engine.go
+index 4db3e6e..fba51e6 100644
+--- a/server/internal/alerts/engine.go
++++ b/server/internal/alerts/engine.go
+@@ -5,9 +5,12 @@
+ // Concurrency model: a single run goroutine owns all mutable state (compiled
+ // rules, subscription handles, rate/cooldown windows, the event-stream child
+ // context). Log-rule sinks run on the hub's delivery goroutines and only push
+-// non-blocking match messages onto firedCh. A single dispatcher goroutine
+-// consumes fired alerts, appends them to history, delivers them to the
+-// configured channels, and records each delivery outcome on the history entry.
++// non-blocking match messages onto firedCh. At the moment a rule fires, the
++// run goroutine captures an immutable snapshot of every enabled channel from
++// one config revision and enqueues it with the alert; a single dispatcher
++// goroutine appends alerts to history, fans them out to the snapshot channels
++// (concurrently, with one retry), and records the summary and per-channel
++// outcomes. Later channel edits never affect a queued or in-flight alert.
+ // Helper goroutines exist only for single container-inspect lookups.
+ package alerts
+ 
+@@ -143,6 +146,17 @@ type inspectResult struct {
+ 	fire     bool
+ }
+ 
++// dispatchItem is one fired alert paired with the immutable snapshot of the
++// channels enabled at its trigger linearization point. Queueing, fan-out,
++// retry and shutdown drain all read channels exclusively from this value
++// copy; the live config is never consulted again for this alert, so a
++// channel edited, disabled or deleted afterwards affects only future
++// triggers.
++type dispatchItem struct {
++	alert    models.Alert
++	channels []config.AlertChannel
++}
++
+ // Engine evaluates alert rules against engine events and log records and
+ // records fired alerts in an in-memory history.
+ type Engine struct {
+@@ -156,7 +170,7 @@ type Engine struct {
+ 	reconcileCh chan struct{}
+ 	firedCh     chan matchMsg
+ 	inspectCh   chan inspectResult
+-	dispatchCh  chan models.Alert
++	dispatchCh  chan dispatchItem
+ 	flushStop   chan struct{}
+ 
+ 	// deliverCtx survives Start-context cancellation so in-flight deliveries
+@@ -166,9 +180,10 @@ type Engine struct {
+ 	deliverCtx context.Context
+ 	skipRetry  <-chan struct{}
+ 
+-	resyncInterval time.Duration
+-	now            func() time.Time
+-	wg             sync.WaitGroup
++	resyncInterval     time.Duration
++	shutdownDrain      time.Duration
++	now                func() time.Time
++	wg                 sync.WaitGroup
+ 
+ 	matchDrops  atomic.Uint64
+ 	loggedDrops uint64 // owned by the run loop
+@@ -200,9 +215,10 @@ func newEngine(hub engineHub, source func() eventClient, alertsFn func() config.
+ 		reconcileCh:    make(chan struct{}, 1),
+ 		firedCh:        make(chan matchMsg, firedBuffer),
+ 		inspectCh:      make(chan inspectResult, inspectBuffer),
+-		dispatchCh:     make(chan models.Alert, dispatchBuffer),
++		dispatchCh:     make(chan dispatchItem, dispatchBuffer),
+ 		flushStop:      make(chan struct{}),
+ 		resyncInterval: defaultResyncInterval,
++		shutdownDrain:  shutdownDrainBudget,
+ 		now:            time.Now,
+ 	}
+ }
+@@ -235,7 +251,7 @@ func (e *Engine) Start(ctx context.Context) {
+ 		defer e.wg.Done()
+ 		defer drainCancel()
+ 		<-ctx.Done()
+-		timer := time.NewTimer(shutdownDrainBudget)
++		timer := time.NewTimer(e.shutdownDrain)
+ 		defer timer.Stop()
+ 		select {
+ 		case <-timer.C:
+@@ -659,8 +675,18 @@ func (e *Engine) window(st *runState, key string, rule *compiledRule) *ruleWindo
+ 	return w
+ }
+ 
+-// emit builds the alert and hands it to the dispatcher without blocking the
+-// run loop; a full dispatch queue drops the alert with a log line.
++// emit builds the alert, captures the immutable snapshot of every channel
++// enabled at this trigger's linearization point, and hands both to the
++// dispatcher without blocking the run loop; a full dispatch queue drops the
++// alert with a log line.
++//
++// The single alertsFn call reads one config revision atomically: the config
++// manager swaps the whole Alerts pointer under its write lock and never
++// mutates a channel slice in place, while the snapshot read takes the read
++// lock, so a trigger racing a channel save uses either the entire old
++// revision or the entire new one — never a mix across channels or retries.
++// A save whose persistence fails rolls the live pointer back, but cannot
++// touch a snapshot already detached here; pending plans are immutable.
+ func (e *Engine) emit(rule *compiledRule, host, containerID, containerName, reason, sample string, suppressed int) {
+ 	alert := models.Alert{
+ 		ID:            newAlertID(),
+@@ -676,8 +702,12 @@ func (e *Engine) emit(rule *compiledRule, host, containerID, containerName, reas
+ 		Suppressed:    suppressed,
+ 		FiredAt:       e.now().UTC().Format(time.RFC3339),
+ 	}
++	item := dispatchItem{
++		alert:    alert,
++		channels: enabledChannels(e.alertsFn().Channels),
++	}
+ 	select {
+-	case e.dispatchCh <- alert:
++	case e.dispatchCh <- item:
+ 	default:
+ 		log.Printf("alerts: dispatch queue full, dropping alert %s (rule %q)", alert.ID, rule.name)
+ 	}
+@@ -730,32 +760,56 @@ func (e *Engine) shutdownRun(st *runState) {
+ 	}
+ }
+ 
+-// dispatchLoop consumes fired alerts: each alert is appended to history first
+-// (Delivery nil) so a hung channel can never lose it, then delivered to every
+-// enabled channel (read live from config; no enabled channels means
+-// history-only) and its history entry updated with the summary result. It exits
+-// when the run loop closes dispatchCh, then stops the history flusher, which
+-// performs the final synchronous flush. Once the shutdown drain budget has
+-// expired, remaining alerts are recorded as failed ("shutdown") without a
+-// delivery attempt.
++// dispatchLoop consumes fired alerts paired with their trigger-time channel
++// snapshot. Each alert is appended to history first (Delivery nil) so a hung
++// channel can never lose it, then delivered to every snapshot channel (a
++// snapshot with no enabled channels means history-only) and its history entry
++// updated with both the summary result and the per-channel outcomes. Live
++// channel configuration is never read here: queueing, fan-out, retry and this
++// loop use the snapshot exclusively. The loop exits when the run loop closes
++// dispatchCh, then stops the history flusher, which performs the final
++// synchronous flush. Once the shutdown drain budget has expired, remaining
++// alerts and their snapshot channels get a deterministic failed ("shutdown")
++// terminal state without a delivery attempt or a live-config read.
+ func (e *Engine) dispatchLoop() {
+ 	defer close(e.flushStop)
+-	for alert := range e.dispatchCh {
+-		e.hist.append(alert)
+-		channels := enabledChannels(e.alertsFn().Channels)
+-		if len(channels) == 0 {
++	for item := range e.dispatchCh {
++		e.hist.append(item.alert)
++		// No channel was enabled at the trigger moment: history-only, keeping
++		// Delivery and Channels nil as in the legacy contract.
++		if len(item.channels) == 0 {
+ 			continue
+ 		}
+ 		var result models.DeliveryResult
++		var deliveries []models.ChannelDelivery
+ 		if e.deliverCtx.Err() != nil {
+ 			result = models.DeliveryResult{Status: "failed", Error: "shutdown"}
++			deliveries = shutdownChannelDeliveries(item.channels)
+ 		} else {
+ 			ctx, cancel := context.WithTimeout(e.deliverCtx, deliverBudget)
+-			result = e.notif.deliverAll(ctx, channels, alert, e.skipRetry)
++			result, deliveries = e.notif.deliverAll(ctx, item.channels, item.alert, e.skipRetry)
+ 			cancel()
+ 		}
+-		e.hist.setDelivery(alert.ID, result)
++		e.hist.setDelivery(item.alert.ID, result, deliveries)
++	}
++}
++
++// shutdownChannelDeliveries builds the terminal per-channel results recorded
++// when the shutdown drain budget expires before an alert can be attempted.
++// Channel identities come from the trigger-time snapshot; the live channel
++// configuration is deliberately not read.
++func shutdownChannelDeliveries(channels []config.AlertChannel) []models.ChannelDelivery {
++	deliveries := make([]models.ChannelDelivery, len(channels))
++	for i, ch := range channels {
++		deliveries[i] = models.ChannelDelivery{
++			ChannelID:   ch.ID,
++			ChannelName: ch.Name,
++			ChannelType: ch.Type,
++			Status:      "failed",
++			Error:       "shutdown",
++		}
+ 	}
++	return deliveries
+ }
+ 
+ // logReason renders the human-readable reason for a fired log rule, e.g.
+diff --git a/server/internal/alerts/engine_test.go b/server/internal/alerts/engine_test.go
+index 10fac54..8ba1c0b 100644
+--- a/server/internal/alerts/engine_test.go
++++ b/server/internal/alerts/engine_test.go
+@@ -589,12 +589,15 @@ func TestDispatchDisabledChannelSkipped(t *testing.T) {
+ 	te.hub.emit(record(models.LogLevelError, "boom"))
+ 
+ 	// The alert is recorded (history-only) but never delivered to the disabled
+-	// channel, so its delivery stays nil.
++	// channel, so its delivery and per-channel results stay nil.
+ 	waitFor(t, "alert in history", func() bool { return len(te.e.History(0)) == 1 })
+ 	time.Sleep(50 * time.Millisecond)
+ 	if d := te.e.History(0)[0].Delivery; d != nil {
+ 		t.Fatalf("delivery = %+v, want nil (channel disabled)", d)
+ 	}
++	if chs := te.e.History(0)[0].Channels; len(chs) != 0 {
++		t.Fatalf("channels = %+v, want none (channel disabled)", chs)
++	}
+ 	if got := hits.Load(); got != 0 {
+ 		t.Fatalf("disabled channel received %d requests, want 0", got)
+ 	}
+diff --git a/server/internal/alerts/history.go b/server/internal/alerts/history.go
+index 17afd84..b6d3913 100644
+--- a/server/internal/alerts/history.go
++++ b/server/internal/alerts/history.go
+@@ -71,15 +71,16 @@ func (h *history) append(a models.Alert) {
+ 	h.dirty = true
+ }
+ 
+-// setDelivery records the delivery result on the entry with the given alert
+-// ID and marks the store dirty. An ID that is no longer present (evicted past
+-// the cap or cleared) is ignored.
+-func (h *history) setDelivery(id string, result models.DeliveryResult) {
++// setDelivery records the summary result and per-channel outcomes on the
++// entry with the given alert ID and marks the store dirty. An ID that is no
++// longer present (evicted past the cap or cleared) is ignored.
++func (h *history) setDelivery(id string, result models.DeliveryResult, channels []models.ChannelDelivery) {
+ 	h.mu.Lock()
+ 	defer h.mu.Unlock()
+ 	for i := range h.entries {
+ 		if h.entries[i].ID == id {
+ 			h.entries[i].Delivery = &result
++			h.entries[i].Channels = channels
+ 			h.dirty = true
+ 			return
+ 		}
+diff --git a/server/internal/alerts/notify.go b/server/internal/alerts/notify.go
+index 662c68b..3a6d00a 100644
+--- a/server/internal/alerts/notify.go
++++ b/server/internal/alerts/notify.go
+@@ -7,6 +7,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
++	"net/url"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -71,6 +72,27 @@ func redactSecret(msg, secret string) string {
+ 	return strings.ReplaceAll(msg, secret, "***")
+ }
+ 
++// urlSecret returns the substring of a channel URL that must be redacted from
++// delivery errors: the request URI (path plus query), which carries the
++// capability token of Slack/Discord-style webhooks and the topic name of ntfy
++// URLs. A URL that fails to parse is redacted wholesale, since an unparsable
++// URL reported verbatim by the HTTP client could itself contain the secret.
++// URLs with no path or query have nothing sensitive to hide.
++func urlSecret(rawURL string) string {
++	u, err := url.Parse(rawURL)
++	if err != nil {
++		return rawURL
++	}
++	secret := u.Path
++	if u.RawQuery != "" {
++		secret += "?" + u.RawQuery
++	}
++	if secret == "" || secret == "/" {
++		return ""
++	}
++	return secret
++}
++
+ // notifier delivers alert payloads to notification channels and reports each
+ // attempt as a models.DeliveryResult.
+ type notifier struct {
+@@ -117,6 +139,9 @@ func buildRequestSpec(ch config.AlertChannel, alert models.Alert) (requestSpec,
+ 			url:     ch.URL,
+ 			headers: map[string]string{"Content-Type": "application/json"},
+ 			body:    body,
++			// Generic webhook URLs (Slack, Discord, Mattermost, ...) embed the
++			// delivery token in the path, which network errors echo verbatim.
++			secret: urlSecret(ch.URL),
+ 		}, nil
+ 	case "ntfy":
+ 		return requestSpec{
+@@ -127,7 +152,8 @@ func buildRequestSpec(ch config.AlertChannel, alert models.Alert) (requestSpec,
+ 				"Priority": "high",
+ 				"Tags":     "warning",
+ 			},
+-			body: []byte(text),
++			body:   []byte(text),
++			secret: urlSecret(ch.URL),
+ 		}, nil
+ 	case "gotify":
+ 		body, err := json.Marshal(gotifyPayload{Title: alertTitle, Message: text, Priority: gotifyPriority})
+@@ -177,12 +203,16 @@ func enabledChannels(channels []config.AlertChannel) []config.AlertChannel {
+ 	return out
+ }
+ 
+-// deliverAll delivers alert to every channel and returns a single summary
+-// result: "ok" when all succeeded, otherwise "failed" with an error naming each
+-// channel that failed. Channels are delivered concurrently so one slow channel
+-// (up to timeout + retry) cannot exhaust the shared delivery budget and starve
+-// the rest. Callers pass the already-enabled channels.
+-func (n *notifier) deliverAll(ctx context.Context, channels []config.AlertChannel, alert models.Alert, skip <-chan struct{}) models.DeliveryResult {
++// deliverAll delivers alert to every channel in the alert's trigger-time
++// snapshot and returns both a single summary result ("ok" only when all
++// succeeded, otherwise "failed" naming each failed channel) and the ordered
++// per-channel outcomes for history. Channels are delivered concurrently so
++// one slow channel (up to timeout + retry) cannot exhaust the shared delivery
++// budget and starve the rest; a failure on one channel never cancels the
++// others. The channels slice is an immutable snapshot captured at trigger
++// time, so retries always hit the original target with the original
++// parameters even if live configuration changed meanwhile.
++func (n *notifier) deliverAll(ctx context.Context, channels []config.AlertChannel, alert models.Alert, skip <-chan struct{}) (models.DeliveryResult, []models.ChannelDelivery) {
+ 	outcomes := make([]channelOutcome, len(channels))
+ 	var wg sync.WaitGroup
+ 	for i, ch := range channels {
+@@ -193,7 +223,26 @@ func (n *notifier) deliverAll(ctx context.Context, channels []config.AlertChanne
+ 		}(i, ch)
+ 	}
+ 	wg.Wait()
+-	return summarizeDeliveries(outcomes)
++	return summarizeDeliveries(outcomes), channelDeliveries(outcomes)
++}
++
++// channelDeliveries projects per-channel outcomes into the history shape:
++// the snapshot's stable channel identity and the already-redacted result,
++// never the target URL, token, or other sending parameters. Order follows
++// the trigger-time snapshot.
++func channelDeliveries(outcomes []channelOutcome) []models.ChannelDelivery {
++	deliveries := make([]models.ChannelDelivery, len(outcomes))
++	for i, o := range outcomes {
++		deliveries[i] = models.ChannelDelivery{
++			ChannelID:   o.channel.ID,
++			ChannelName: o.channel.Name,
++			ChannelType: o.channel.Type,
++			Status:      o.result.Status,
++			HTTPStatus:  o.result.HTTPStatus,
++			Error:       o.result.Error,
++		}
++	}
++	return deliveries
+ }
+ 
+ // summarizeDeliveries collapses per-channel outcomes into one history result.
+diff --git a/server/internal/alerts/notify_test.go b/server/internal/alerts/notify_test.go
+index 70036e0..69b797d 100644
+--- a/server/internal/alerts/notify_test.go
++++ b/server/internal/alerts/notify_test.go
+@@ -7,6 +7,7 @@ import (
+ 	"io"
+ 	"net/http"
+ 	"net/http/httptest"
++	"reflect"
+ 	"strings"
+ 	"sync/atomic"
+ 	"testing"
+@@ -208,6 +209,64 @@ func TestDeliveryErrorRedactsTelegramToken(t *testing.T) {
+ 	}
+ }
+ 
++// Slack/Discord-style webhook URLs embed the capability token in the path; a
++// network error echoes the full URL, so the path must be redacted before the
++// error reaches alert history.
++func TestDeliveryErrorRedactsWebhookURLSecret(t *testing.T) {
++	n := &notifier{client: &http.Client{Transport: failingRoundTripper{}}, retryDelay: 0}
++	ch := config.AlertChannel{ID: "c1", Type: "webhook", Enabled: true, URL: "https://hooks.example.com/services/T00/B00/secret-token"}
++
++	res := n.deliver(context.Background(), ch, testAlert(), nil)
++	if res.Status != "failed" {
++		t.Fatalf("status = %q, want failed", res.Status)
++	}
++	if strings.Contains(res.Error, "secret-token") || strings.Contains(res.Error, "/services/T00/B00/secret-token") {
++		t.Fatalf("delivery error leaked the webhook URL secret: %q", res.Error)
++	}
++	if !strings.Contains(res.Error, "***") {
++		t.Fatalf("expected the URL path to be redacted, got %q", res.Error)
++	}
++	// The host remains visible for diagnosis.
++	if !strings.Contains(res.Error, "hooks.example.com") {
++		t.Fatalf("redaction should keep the host, got %q", res.Error)
++	}
++}
++
++// The ntfy topic path acts as a capability for private topics and must be
++// redacted the same way.
++func TestDeliveryErrorRedactsNtfyTopic(t *testing.T) {
++	n := &notifier{client: &http.Client{Transport: failingRoundTripper{}}, retryDelay: 0}
++	ch := config.AlertChannel{ID: "c1", Type: "ntfy", Enabled: true, URL: "https://ntfy.example.com/private-topic?auth=secretquery"}
++
++	res := n.deliver(context.Background(), ch, testAlert(), nil)
++	if strings.Contains(res.Error, "private-topic") || strings.Contains(res.Error, "secretquery") {
++		t.Fatalf("delivery error leaked the ntfy topic/query: %q", res.Error)
++	}
++	if !strings.Contains(res.Error, "***") {
++		t.Fatalf("expected the topic path/query to be redacted, got %q", res.Error)
++	}
++}
++
++func TestURLSecret(t *testing.T) {
++	cases := []struct {
++		name string
++		raw  string
++		want string
++	}{
++		{"slack path", "https://hooks.slack.com/services/T/B/X", "/services/T/B/X"},
++		{"host only", "https://example.com", ""},
++		{"root path", "https://example.com/", ""},
++		{"path and query", "https://e.com/t?x=1", "/t?x=1"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := urlSecret(tc.raw); got != tc.want {
++				t.Fatalf("urlSecret(%q) = %q, want %q", tc.raw, got, tc.want)
++			}
++		})
++	}
++}
++
+ func TestDeliverAllSummarizesFailures(t *testing.T) {
+ 	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+ 	defer okSrv.Close()
+@@ -221,7 +280,7 @@ func TestDeliverAllSummarizesFailures(t *testing.T) {
+ 		{ID: "c2", Type: "webhook", Name: "bad", Enabled: true, URL: badSrv.URL},
+ 	}
+ 	n := newNotifier()
+-	res := n.deliverAll(context.Background(), channels, testAlert(), nil)
++	res, perChannel := n.deliverAll(context.Background(), channels, testAlert(), nil)
+ 
+ 	if res.Status != "failed" {
+ 		t.Fatalf("status = %q, want failed", res.Status)
+@@ -232,6 +291,13 @@ func TestDeliverAllSummarizesFailures(t *testing.T) {
+ 	if strings.Contains(res.Error, "good:") {
+ 		t.Fatalf("error %q should not list the succeeding channel", res.Error)
+ 	}
++	want := []models.ChannelDelivery{
++		{ChannelID: "c1", ChannelName: "good", ChannelType: "webhook", Status: "ok", HTTPStatus: http.StatusOK},
++		{ChannelID: "c2", ChannelName: "bad", ChannelType: "webhook", Status: "failed", HTTPStatus: http.StatusBadRequest, Error: "channel returned 400 Bad Request"},
++	}
++	if !reflect.DeepEqual(perChannel, want) {
++		t.Fatalf("per-channel results = %+v, want %+v", perChannel, want)
++	}
+ }
+ 
+ func TestDeliverAllAllOK(t *testing.T) {
+@@ -243,7 +309,7 @@ func TestDeliverAllAllOK(t *testing.T) {
+ 		{ID: "c2", Type: "ntfy", Enabled: true, URL: srv.URL + "/t"},
+ 	}
+ 	n := newNotifier()
+-	res := n.deliverAll(context.Background(), channels, testAlert(), nil)
++	res, perChannel := n.deliverAll(context.Background(), channels, testAlert(), nil)
+ 	if res.Status != "ok" {
+ 		t.Fatalf("result = %+v, want ok", res)
+ 	}
+@@ -251,6 +317,12 @@ func TestDeliverAllAllOK(t *testing.T) {
+ 	if res.HTTPStatus != 0 {
+ 		t.Fatalf("httpStatus = %d, want 0 for a multi-channel summary", res.HTTPStatus)
+ 	}
++	if len(perChannel) != 2 || perChannel[0].Status != "ok" || perChannel[1].Status != "ok" {
++		t.Fatalf("per-channel results = %+v, want both ok", perChannel)
++	}
++	if perChannel[0].ChannelID != "c1" || perChannel[1].ChannelID != "c2" {
++		t.Fatalf("per-channel results lost snapshot identity/order: %+v", perChannel)
++	}
+ }
+ 
+ func TestDeliverRetriesOnceOn5xx(t *testing.T) {
+diff --git a/server/internal/alerts/snapshot_test.go b/server/internal/alerts/snapshot_test.go
+new file mode 100644
+index 0000000..e6415a4
+--- /dev/null
++++ b/server/internal/alerts/snapshot_test.go
+@@ -0,0 +1,459 @@
++package alerts
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/AmoabaKelvin/logdeck/internal/config"
++	"github.com/AmoabaKelvin/logdeck/internal/models"
++)
++
++// gateHandler blocks every request until release or the request context
++// aborts (shutdown cancellation), so a test server never keeps Close waiting.
++func gateHandler(t *testing.T, hits *atomic.Int32, proceed <-chan struct{}) http.HandlerFunc {
++	t.Helper()
++	return func(w http.ResponseWriter, r *http.Request) {
++		hits.Add(1)
++		select {
++		case <-proceed:
++		case <-r.Context().Done():
++		}
++	}
++}
++
++// countHandler replies code and counts hits.
++func countHandler(hits *atomic.Int32, code int) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		hits.Add(1)
++		w.WriteHeader(code)
++	}
++}
++
++// twoPatternRules returns two threshold-1 log rules with distinct patterns so
++// two alerts can be fired back to back without hitting cooldown windows.
++func twoPatternRules() []config.AlertRule {
++	return []config.AlertRule{
++		{ID: "r1", Name: "one", Enabled: true, Type: "log", Pattern: "boom1", Threshold: 1},
++		{ID: "r2", Name: "two", Enabled: true, Type: "log", Pattern: "boom2", Threshold: 1},
++	}
++}
++
++// A channel edited after an alert triggered but before it is dispatched must
++// not redirect the queued alert: the trigger-time snapshot pins the original
++// target (and its parameters), and history records the snapshot's stable
++// channel ID.
++func TestQueuedAlertUsesSnapshotWhenChannelEdited(t *testing.T) {
++	proceed := make(chan struct{})
++	var once sync.Once
++	release := func() { once.Do(func() { close(proceed) }) }
++	var blockHits, newHits atomic.Int32
++	blockSrv := httptest.NewServer(gateHandler(t, &blockHits, proceed))
++	defer blockSrv.Close()
++	defer release()
++	newSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		newHits.Add(1)
++	}))
++	defer newSrv.Close()
++
++	rules := twoPatternRules()
++	te := startTestEngine(t, rules...)
++	te.conf.set(config.AlertsConfig{Channels: webhookChannels(blockSrv.URL), Rules: rules})
++	waitFor(t, "subscriptions", func() bool { return te.hub.liveCount() == 2 })
++
++	// Alert 1 occupies the dispatcher; its snapshot delivery hangs on blockSrv.
++	te.hub.emit(record(models.LogLevelError, "boom1"))
++	waitFor(t, "first alert in history", func() bool { return len(te.e.History(0)) == 1 })
++
++	// Alert 2 is captured against the same channel revision and waits queued.
++	te.hub.emit(record(models.LogLevelError, "boom2"))
++	waitFor(t, "second alert queued", func() bool { return len(te.e.dispatchCh) == 1 })
++
++	// Same stable ID, brand-new address, after both trigger points.
++	te.conf.set(config.AlertsConfig{
++		Channels: []config.AlertChannel{{ID: "c1", Type: "webhook", Enabled: true, URL: newSrv.URL + "/new-secret"}},
++		Rules:    rules,
++	})
++
++	release()
++	waitFor(t, "both delivered", func() bool {
++		h := te.e.History(0)
++		return len(h) == 2 && h[0].Delivery != nil && h[1].Delivery != nil
++	})
++
++	if got := newHits.Load(); got != 0 {
++		t.Fatalf("edited channel received %d in-flight/queued requests, want 0", got)
++	}
++	if got := blockHits.Load(); got != 2 {
++		t.Fatalf("original target received %d requests, want 2 (one per alert snapshot)", got)
++	}
++	for _, a := range te.e.History(0) {
++		if len(a.Channels) != 1 || a.Channels[0].ChannelID != "c1" || a.Channels[0].ChannelType != "webhook" || a.Channels[0].Status != "ok" {
++			t.Fatalf("alert %s per-channel results = %+v, want one ok result for snapshot channel c1", a.ID, a.Channels)
++		}
++	}
++
++	// The per-channel result must survive history persistence without leaking
++	// any target or secret.
++	te.e.hist.flushIfDirty()
++	data, err := os.ReadFile(te.path)
++	if err != nil {
++		t.Fatalf("read flushed history: %v", err)
++	}
++	s := string(data)
++	if !strings.Contains(s, `"channelId": "c1"`) || !strings.Contains(s, `"channelType": "webhook"`) {
++		t.Fatalf("flushed history missing per-channel results: %s", s)
++	}
++	if strings.Contains(s, "new-secret") || strings.Contains(s, blockSrv.URL) {
++		t.Fatalf("flushed history leaked channel target/secret: %s", s)
++	}
++}
++
++// Disabling or deleting a channel after the trigger point must not suppress
++// the queued alert: it still fans out to every snapshot channel and keeps
++// their per-channel outcomes.
++func TestQueuedAlertDeliveredAfterChannelsDeleted(t *testing.T) {
++	proceed := make(chan struct{})
++	var once sync.Once
++	release := func() { once.Do(func() { close(proceed) }) }
++	var blockHits, targetHits atomic.Int32
++	blockSrv := httptest.NewServer(gateHandler(t, &blockHits, proceed))
++	defer blockSrv.Close()
++	defer release()
++	targetSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		targetHits.Add(1)
++	}))
++	defer targetSrv.Close()
++
++	rules := twoPatternRules()
++	te := startTestEngine(t, rules...)
++	te.conf.set(config.AlertsConfig{
++		Channels: []config.AlertChannel{
++			{ID: "c1", Type: "webhook", Name: "blocker", Enabled: true, URL: blockSrv.URL},
++			{ID: "c2", Type: "webhook", Name: "target", Enabled: true, URL: targetSrv.URL},
++		},
++		Rules: rules,
++	})
++	waitFor(t, "subscriptions", func() bool { return te.hub.liveCount() == 2 })
++
++	te.hub.emit(record(models.LogLevelError, "boom1"))
++	waitFor(t, "first alert in history", func() bool { return len(te.e.History(0)) == 1 })
++	waitFor(t, "first alert reaches the non-blocking channel", func() bool { return targetHits.Load() == 1 })
++
++	te.hub.emit(record(models.LogLevelError, "boom2"))
++	waitFor(t, "second alert queued", func() bool { return len(te.e.dispatchCh) == 1 })
++
++	// Operator deletes all channels while the second alert sits queued.
++	te.conf.set(config.AlertsConfig{Channels: nil, Rules: rules})
++
++	release()
++	waitFor(t, "both delivered", func() bool {
++		h := te.e.History(0)
++		return len(h) == 2 && h[0].Delivery != nil && h[1].Delivery != nil
++	})
++
++	if got := targetHits.Load(); got != 2 {
++		t.Fatalf("deleted channel target received %d requests, want 2", got)
++	}
++	if got := blockHits.Load(); got != 2 {
++		t.Fatalf("deleted blocking channel received %d requests, want 2", got)
++	}
++	for _, a := range te.e.History(0) {
++		ids := map[string]bool{}
++		if len(a.Channels) != 2 {
++			t.Fatalf("alert %s channels = %+v, want both snapshot channels retained", a.ID, a.Channels)
++		}
++		for _, c := range a.Channels {
++			ids[c.ChannelID] = true
++			if c.Status != "ok" {
++				t.Fatalf("alert %s channel %s = %+v, want ok", a.ID, c.ChannelID, c)
++			}
++		}
++		if !ids["c1"] || !ids["c2"] {
++			t.Fatalf("alert %s per-channel ids = %v, want c1 and c2", a.ID, ids)
++		}
++	}
++}
++
++// One failing channel must not prevent delivery to the others, and history
++// keeps the outcome of each channel independently.
++func TestPerChannelFailureIsolation(t *testing.T) {
++	var goodHits, badHits atomic.Int32
++	goodSrv := httptest.NewServer(countHandler(&goodHits, http.StatusOK))
++	defer goodSrv.Close()
++	badSrv := httptest.NewServer(countHandler(&badHits, http.StatusInternalServerError))
++	defer badSrv.Close()
++
++	te := startTestEngine(t, config.AlertRule{ID: "r1", Name: "boom", Enabled: true, Type: "log", Pattern: "boom", Threshold: 1})
++	te.e.notif.retryDelay = 0 // retry immediately so the test stays fast
++	te.conf.set(config.AlertsConfig{
++		Channels: []config.AlertChannel{
++			{ID: "c1", Type: "webhook", Name: "bad", Enabled: true, URL: badSrv.URL},
++			{ID: "c2", Type: "webhook", Name: "good", Enabled: true, URL: goodSrv.URL},
++		},
++		Rules: te.conf.get().Rules,
++	})
++	waitFor(t, "subscription", func() bool { return te.hub.liveCount() == 1 })
++
++	te.hub.emit(record(models.LogLevelError, "boom"))
++	var entry models.Alert
++	waitFor(t, "delivery recorded", func() bool {
++		h := te.e.History(0)
++		if len(h) != 1 || h[0].Delivery == nil {
++			return false
++		}
++		entry = h[0]
++		return true
++	})
++
++	if got := goodHits.Load(); got != 1 {
++		t.Fatalf("healthy channel hits = %d, want 1 (a bad peer must not starve it)", got)
++	}
++	if got := badHits.Load(); got != 2 {
++		t.Fatalf("failing channel hits = %d, want 2 (one immediate retry on 5xx)", got)
++	}
++	if entry.Delivery.Status != "failed" {
++		t.Fatalf("summary = %+v, want failed", entry.Delivery)
++	}
++	byID := map[string]models.ChannelDelivery{}
++	for _, c := range entry.Channels {
++		byID[c.ChannelID] = c
++	}
++	bad, ok1 := byID["c1"]
++	good, ok2 := byID["c2"]
++	if !ok1 || !ok2 {
++		t.Fatalf("per-channel results = %+v, want c1 and c2", entry.Channels)
++	}
++	if bad.Status != "failed" || bad.HTTPStatus != http.StatusInternalServerError || bad.Error == "" {
++		t.Fatalf("bad channel result = %+v, want failed/500 with error", bad)
++	}
++	if good.Status != "ok" || good.HTTPStatus != http.StatusOK {
++		t.Fatalf("good channel result = %+v, want ok/200", good)
++	}
++}
++
++// The post-failure retry must reuse the trigger-time request (original target
++// and parameters) even if the channel was edited during the retry wait.
++func TestRetryHitsOriginalTargetAfterConfigEdit(t *testing.T) {
++	var oldHits, newHits atomic.Int32
++	oldSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if oldHits.Add(1) == 1 {
++			w.WriteHeader(http.StatusInternalServerError)
++			return
++		}
++	}))
++	defer oldSrv.Close()
++	newSrv := httptest.NewServer(countHandler(&newHits, http.StatusOK))
++	defer newSrv.Close()
++
++	te := startTestEngine(t, config.AlertRule{ID: "r1", Name: "boom", Enabled: true, Type: "log", Pattern: "boom", Threshold: 1})
++	te.e.notif.retryDelay = 100 * time.Millisecond
++	te.conf.set(config.AlertsConfig{
++		Channels: []config.AlertChannel{{ID: "c1", Type: "webhook", Enabled: true, URL: oldSrv.URL + "/old-target"}},
++		Rules:    te.conf.get().Rules,
++	})
++	waitFor(t, "subscription", func() bool { return te.hub.liveCount() == 1 })
++
++	te.hub.emit(record(models.LogLevelError, "boom"))
++	waitFor(t, "first attempt failed", func() bool { return oldHits.Load() == 1 })
++
++	// Edit the channel while the retry is waiting.
++	te.conf.set(config.AlertsConfig{
++		Channels: []config.AlertChannel{{ID: "c1", Type: "webhook", Enabled: true, URL: newSrv.URL}},
++		Rules:    te.conf.get().Rules,
++	})
++
++	waitFor(t, "delivery recorded", func() bool {
++		h := te.e.History(0)
++		return len(h) == 1 && h[0].Delivery != nil
++	})
++	if got := oldHits.Load(); got != 2 {
++		t.Fatalf("original target hits = %d, want 2 (initial attempt + retry)", got)
++	}
++	if got := newHits.Load(); got != 0 {
++		t.Fatalf("retry followed the edited target: new channel hits = %d, want 0", got)
++	}
++	if d := te.e.History(0)[0].Delivery; d.Status != "ok" {
++		t.Fatalf("delivery = %+v, want ok after retrying the original target", d)
++	}
++}
++
++// When the shutdown drain budget expires, the in-flight alert and the queued
++// alert both reach a deterministic terminal state derived solely from their
++// snapshots; the dispatcher must not read (and follow) live configuration.
++func TestShutdownDrainTerminalStatesUseSnapshot(t *testing.T) {
++	proceed := make(chan struct{}) // not released during the test: the drain
++	// budget aborts the request client-side; it is closed on teardown so the
++	// gate handler can return before the test server closes.
++	var blockHits atomic.Int32
++	blockSrv := httptest.NewServer(gateHandler(t, &blockHits, proceed))
++	defer blockSrv.Close()
++	defer close(proceed)
++	var goodHits atomic.Int32
++	goodSrv := httptest.NewServer(countHandler(&goodHits, http.StatusOK))
++	defer goodSrv.Close()
++	var swappedHits atomic.Int32
++	swappedSrv := httptest.NewServer(countHandler(&swappedHits, http.StatusOK))
++	defer swappedSrv.Close()
++
++	rules := twoPatternRules()
++	te := &testEngine{
++		hub:    &fakeHub{},
++		events: newFakeEvents(),
++		conf:   &fakeConf{cfg: config.AlertsConfig{Rules: rules}},
++		clock:  &fakeClock{t: t0},
++		path:   filepath.Join(t.TempDir(), "alerts-history.json"),
++	}
++	te.e = newEngine(te.hub, func() eventClient { return te.events }, te.conf.get, te.path)
++	te.e.now = te.clock.now
++	te.e.shutdownDrain = 250 * time.Millisecond
++
++	ctx, cancel := context.WithCancel(context.Background())
++	te.cancel = cancel
++	te.e.Start(ctx)
++	t.Cleanup(func() {
++		cancel()
++		te.e.Wait()
++	})
++
++	te.conf.set(config.AlertsConfig{
++		Channels: []config.AlertChannel{
++			{ID: "c1", Type: "webhook", Name: "block", Enabled: true, URL: blockSrv.URL},
++			{ID: "c2", Type: "webhook", Name: "good", Enabled: true, URL: goodSrv.URL},
++		},
++		Rules: rules,
++	})
++	waitFor(t, "subscriptions", func() bool { return te.hub.liveCount() == 2 })
++
++	te.hub.emit(record(models.LogLevelError, "boom1"))
++	waitFor(t, "first alert in history", func() bool { return len(te.e.History(0)) == 1 })
++	te.hub.emit(record(models.LogLevelError, "boom2"))
++	waitFor(t, "second alert queued", func() bool { return len(te.e.dispatchCh) == 1 })
++
++	cancel()
++	// Swap live configuration during the drain: no delivery may follow it.
++	te.conf.set(config.AlertsConfig{
++		Channels: []config.AlertChannel{{ID: "c9", Type: "webhook", Enabled: true, URL: swappedSrv.URL}},
++		Rules:    rules,
++	})
++
++	done := make(chan struct{})
++	go func() {
++		te.e.Wait()
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(3 * time.Second):
++		t.Fatal("Wait did not return promptly after the drain budget")
++	}
++
++	h := te.e.History(0)
++	if len(h) != 2 {
++		t.Fatalf("history = %d entries, want 2", len(h))
++	}
++	for _, a := range h {
++		if a.Delivery == nil || a.Delivery.Status != "failed" {
++			t.Fatalf("alert %s delivery = %+v, want a failed terminal state", a.ID, a.Delivery)
++		}
++	}
++	// Newest entry is the queued alert: every snapshot channel gets a
++	// deterministic "shutdown" result without any delivery attempt.
++	queued := h[0]
++	if len(queued.Channels) != 2 {
++		t.Fatalf("queued alert channels = %+v, want 2 snapshot channels", queued.Channels)
++	}
++	for _, c := range queued.Channels {
++		if c.Status != "failed" || c.Error != "shutdown" {
++			t.Fatalf("queued alert channel result = %+v, want failed/shutdown", c)
++		}
++	}
++	// In-flight entry: the healthy channel already succeeded; the blocked one
++	// was aborted by the drain and is failed. Neither followed the swap.
++	inFlight := h[1]
++	byID := map[string]models.ChannelDelivery{}
++	for _, c := range inFlight.Channels {
++		byID[c.ChannelID] = c
++	}
++	if c := byID["c2"]; c.Status != "ok" {
++		t.Fatalf("in-flight good channel = %+v, want ok before the drain", c)
++	}
++	if c := byID["c1"]; c.Status != "failed" || c.Error == "" {
++		t.Fatalf("in-flight blocked channel = %+v, want failed with an abort error", c)
++	}
++	if got := swappedHits.Load(); got != 0 {
++		t.Fatalf("drain followed live config: swapped channel hits = %d, want 0", got)
++	}
++
++	// The terminal states reach the persisted history file.
++	data, err := os.ReadFile(te.path)
++	if err != nil {
++		t.Fatalf("history not flushed: %v", err)
++	}
++	s := string(data)
++	for _, want := range []string{`"error": "shutdown"`, `"channelId": "c1"`, `"channelId": "c2"`} {
++		if !strings.Contains(s, want) {
++			t.Fatalf("flushed history missing %q in terminal per-channel results: %s", want, s)
++		}
++	}
++}
++
++// Legacy history files (delivery summary, no per-channel results) keep
++// loading, and old entries survive a new flush unchanged in shape.
++func TestHistoryLoadsLegacyEntriesWithoutChannelResults(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "alerts-history.json")
++	legacy := `[
++  {
++    "id": "abcd1234",
++    "ruleId": "r1",
++    "ruleName": "old",
++    "type": "log",
++    "host": "local",
++    "containerId": "",
++    "containerName": "web",
++    "reason": "boom",
++    "count": 1,
++    "suppressed": 0,
++    "firedAt": "2026-07-10T12:00:00Z",
++    "delivery": {"status": "failed", "httpStatus": 500, "error": "channel returned 500 Internal Server Error"}
++  }
++]`
++	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
++		t.Fatalf("write legacy history: %v", err)
++	}
++	h := newHistory(path, historyCap)
++	h.load()
++	entries := h.list(0)
++	if len(entries) != 1 || entries[0].Delivery == nil || entries[0].Delivery.Status != "failed" {
++		t.Fatalf("legacy entry = %+v, want delivery summary preserved", entries)
++	}
++	if entries[0].Channels != nil {
++		t.Fatalf("legacy channels = %+v, want nil", entries[0].Channels)
++	}
++
++	// A new result written on top keeps both shapes side by side and
++	// round-trips through disk.
++	h.setDelivery("abcd1234", models.DeliveryResult{Status: "ok"}, []models.ChannelDelivery{
++		{ChannelID: "c1", ChannelType: "webhook", Status: "ok", HTTPStatus: 200},
++	})
++	h.flushIfDirty()
++	data, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatalf("read flushed history: %v", err)
++	}
++	var onDisk []models.Alert
++	if err := json.Unmarshal(data, &onDisk); err != nil || len(onDisk) != 1 {
++		t.Fatalf("flushed history = %s (err %v)", data, err)
++	}
++	if len(onDisk[0].Channels) != 1 || onDisk[0].Channels[0].ChannelID != "c1" {
++		t.Fatalf("flushed per-channel results = %+v", onDisk[0].Channels)
++	}
++}
+diff --git a/server/internal/models/alerts.go b/server/internal/models/alerts.go
+index 1bdc92e..659b81b 100644
+--- a/server/internal/models/alerts.go
++++ b/server/internal/models/alerts.go
+@@ -40,6 +40,11 @@ type Alert struct {
+ 	Suppressed    int             `json:"suppressed"`
+ 	FiredAt       string          `json:"firedAt"`
+ 	Delivery      *DeliveryResult `json:"delivery,omitempty"`
++	// Channels holds the per-channel outcomes of the immutable trigger-time
++	// channel snapshot. It is absent for history entries written before
++	// per-channel tracking and for alerts with no enabled channels
++	// (history-only). Targets and secrets are never stored here.
++	Channels []ChannelDelivery `json:"channels,omitempty"`
+ }
+ 
+ // DeliveryResult records the outcome of one webhook delivery attempt.
+@@ -48,3 +53,16 @@ type DeliveryResult struct {
+ 	HTTPStatus int    `json:"httpStatus,omitempty"`
+ 	Error      string `json:"error,omitempty"`
+ }
++
++// ChannelDelivery records the outcome for one channel in an alert's
++// trigger-time snapshot. Only the stable channel identity and a redacted
++// result are persisted — never the target URL, token, or other sending
++// parameters.
++type ChannelDelivery struct {
++	ChannelID   string `json:"channelId"`
++	ChannelName string `json:"channelName,omitempty"`
++	ChannelType string `json:"channelType"`
++	Status      string `json:"status"` // "ok" | "failed"
++	HTTPStatus  int    `json:"httpStatus,omitempty"`
++	Error       string `json:"error,omitempty"`
++}

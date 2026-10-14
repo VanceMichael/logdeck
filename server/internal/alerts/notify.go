@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -71,6 +72,27 @@ func redactSecret(msg, secret string) string {
 	return strings.ReplaceAll(msg, secret, "***")
 }
 
+// urlSecret returns the substring of a channel URL that must be redacted from
+// delivery errors: the request URI (path plus query), which carries the
+// capability token of Slack/Discord-style webhooks and the topic name of ntfy
+// URLs. A URL that fails to parse is redacted wholesale, since an unparsable
+// URL reported verbatim by the HTTP client could itself contain the secret.
+// URLs with no path or query have nothing sensitive to hide.
+func urlSecret(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	secret := u.Path
+	if u.RawQuery != "" {
+		secret += "?" + u.RawQuery
+	}
+	if secret == "" || secret == "/" {
+		return ""
+	}
+	return secret
+}
+
 // notifier delivers alert payloads to notification channels and reports each
 // attempt as a models.DeliveryResult.
 type notifier struct {
@@ -117,6 +139,9 @@ func buildRequestSpec(ch config.AlertChannel, alert models.Alert) (requestSpec, 
 			url:     ch.URL,
 			headers: map[string]string{"Content-Type": "application/json"},
 			body:    body,
+			// Generic webhook URLs (Slack, Discord, Mattermost, ...) embed the
+			// delivery token in the path, which network errors echo verbatim.
+			secret: urlSecret(ch.URL),
 		}, nil
 	case "ntfy":
 		return requestSpec{
@@ -127,7 +152,8 @@ func buildRequestSpec(ch config.AlertChannel, alert models.Alert) (requestSpec, 
 				"Priority": "high",
 				"Tags":     "warning",
 			},
-			body: []byte(text),
+			body:   []byte(text),
+			secret: urlSecret(ch.URL),
 		}, nil
 	case "gotify":
 		body, err := json.Marshal(gotifyPayload{Title: alertTitle, Message: text, Priority: gotifyPriority})
@@ -177,12 +203,16 @@ func enabledChannels(channels []config.AlertChannel) []config.AlertChannel {
 	return out
 }
 
-// deliverAll delivers alert to every channel and returns a single summary
-// result: "ok" when all succeeded, otherwise "failed" with an error naming each
-// channel that failed. Channels are delivered concurrently so one slow channel
-// (up to timeout + retry) cannot exhaust the shared delivery budget and starve
-// the rest. Callers pass the already-enabled channels.
-func (n *notifier) deliverAll(ctx context.Context, channels []config.AlertChannel, alert models.Alert, skip <-chan struct{}) models.DeliveryResult {
+// deliverAll delivers alert to every channel in the alert's trigger-time
+// snapshot and returns both a single summary result ("ok" only when all
+// succeeded, otherwise "failed" naming each failed channel) and the ordered
+// per-channel outcomes for history. Channels are delivered concurrently so
+// one slow channel (up to timeout + retry) cannot exhaust the shared delivery
+// budget and starve the rest; a failure on one channel never cancels the
+// others. The channels slice is an immutable snapshot captured at trigger
+// time, so retries always hit the original target with the original
+// parameters even if live configuration changed meanwhile.
+func (n *notifier) deliverAll(ctx context.Context, channels []config.AlertChannel, alert models.Alert, skip <-chan struct{}) (models.DeliveryResult, []models.ChannelDelivery) {
 	outcomes := make([]channelOutcome, len(channels))
 	var wg sync.WaitGroup
 	for i, ch := range channels {
@@ -193,7 +223,26 @@ func (n *notifier) deliverAll(ctx context.Context, channels []config.AlertChanne
 		}(i, ch)
 	}
 	wg.Wait()
-	return summarizeDeliveries(outcomes)
+	return summarizeDeliveries(outcomes), channelDeliveries(outcomes)
+}
+
+// channelDeliveries projects per-channel outcomes into the history shape:
+// the snapshot's stable channel identity and the already-redacted result,
+// never the target URL, token, or other sending parameters. Order follows
+// the trigger-time snapshot.
+func channelDeliveries(outcomes []channelOutcome) []models.ChannelDelivery {
+	deliveries := make([]models.ChannelDelivery, len(outcomes))
+	for i, o := range outcomes {
+		deliveries[i] = models.ChannelDelivery{
+			ChannelID:   o.channel.ID,
+			ChannelName: o.channel.Name,
+			ChannelType: o.channel.Type,
+			Status:      o.result.Status,
+			HTTPStatus:  o.result.HTTPStatus,
+			Error:       o.result.Error,
+		}
+	}
+	return deliveries
 }
 
 // summarizeDeliveries collapses per-channel outcomes into one history result.
