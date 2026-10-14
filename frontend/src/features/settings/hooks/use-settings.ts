@@ -23,7 +23,9 @@ import type { APITokenScope } from "../types";
 
 const SETTINGS_KEY = ["settings"] as const;
 const API_TOKENS_KEY = ["settings", "api-tokens"] as const;
-const HISTORY_STATUS_KEY = ["history", "status"] as const;
+// Covers status, the stored-container list, and history pages: a persistence
+// toggle changes the availability of all of them at once.
+const HISTORY_KEY = ["history"] as const;
 // The container list carries the host set and the read-only flag.
 const CONTAINERS_KEY = ["containers"] as const;
 // An open environment panel is routed by whether its host has a connection.
@@ -95,15 +97,16 @@ export function useUpdateReadOnly() {
 	});
 }
 
-// The usage bar and the per-container cap text read their limits from
-// /history/status, so that query is invalidated alongside the settings.
+// Toggling persistence starts/stops the server's store, so every history query
+// (status gates the UI; the lists and pages read it) is invalidated together
+// with the settings.
 export function useUpdateLogStorage() {
 	const queryClient = useQueryClient();
 	return useMutation({
 		mutationFn: (payload: UpdateLogStoragePayload) => updateLogStorage(payload),
 		onSuccess: () => {
 			queryClient.invalidateQueries({ queryKey: SETTINGS_KEY });
-			queryClient.invalidateQueries({ queryKey: HISTORY_STATUS_KEY });
+			queryClient.invalidateQueries({ queryKey: HISTORY_KEY });
 		},
 	});
 }

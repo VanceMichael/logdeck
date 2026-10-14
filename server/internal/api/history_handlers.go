@@ -1,6 +1,7 @@
 package api
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -16,6 +17,22 @@ import (
 	"github.com/AmoabaKelvin/logdeck/internal/models"
 	"github.com/go-chi/chi/v5"
 )
+
+// disabledResponse is the body every history entry returns while persistence
+// is off (including the instant a runtime toggle flips it).
+func disabledResponse(w http.ResponseWriter) {
+	WriteJsonResponse(w, http.StatusServiceUnavailable, map[string]string{
+		"error": "log persistence is disabled",
+	})
+}
+
+// storeClosing reports whether a call lost the race with a disable that closed
+// the database pool. database/sql closes safely concurrently with in-flight
+// calls but hands these errors to a call started around the close; such a
+// request is answered as "disabled", not as a server fault.
+func storeClosing(err error) bool {
+	return errors.Is(err, sql.ErrConnDone) || strings.Contains(err.Error(), "database is closed")
+}
 
 // validHistoryLevels are the level names accepted by the history log filter.
 // UNKNOWN is included: unclassified lines are stored under it and a user may
@@ -38,7 +55,8 @@ var validHistoryLevels = map[string]bool{
 // With persistence disabled the response carries "enabled": false and nothing
 // else: there is no database to size and the caps are not in force.
 func (ar *APIRouter) GetHistoryStatus(w http.ResponseWriter, r *http.Request) {
-	if ar.logStore == nil {
+	store := ar.activeLogStore()
+	if store == nil {
 		WriteJsonResponse(w, http.StatusOK, map[string]any{"enabled": false})
 		return
 	}
@@ -46,8 +64,12 @@ func (ar *APIRouter) GetHistoryStatus(w http.ResponseWriter, r *http.Request) {
 	// A failed stat is reported as a zero size rather than a 500: the status
 	// endpoint gates History mode in the frontend, and the store works whether
 	// or not its file can be measured.
-	size, err := ar.logStore.DBSize()
+	size, err := store.DBSize()
 	if err != nil {
+		if storeClosing(err) {
+			WriteJsonResponse(w, http.StatusOK, map[string]any{"enabled": false})
+			return
+		}
 		log.Printf("history: measuring the log database failed: %v", err)
 	}
 
@@ -65,10 +87,9 @@ func (ar *APIRouter) GetHistoryStatus(w http.ResponseWriter, r *http.Request) {
 // read-scoped API tokens and blocked in read-only mode (see
 // registerHistoryRoutes).
 func (ar *APIRouter) DeleteHistoryContainer(w http.ResponseWriter, r *http.Request) {
-	if ar.logStore == nil {
-		WriteJsonResponse(w, http.StatusServiceUnavailable, map[string]string{
-			"error": "log persistence is disabled",
-		})
+	store := ar.activeLogStore()
+	if store == nil {
+		disabledResponse(w)
 		return
 	}
 
@@ -85,10 +106,14 @@ func (ar *APIRouter) DeleteHistoryContainer(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	deleted, err := ar.logStore.DeleteContainer(r.Context(), host, name)
+	deleted, err := store.DeleteContainer(r.Context(), host, name)
 	if err != nil {
 		if errors.Is(err, logstore.ErrContainerNotFound) {
 			http.Error(w, "no stored logs for this container", http.StatusNotFound)
+			return
+		}
+		if storeClosing(err) {
+			disabledResponse(w)
 			return
 		}
 		log.Printf("history: deleting stored logs failed: %v", err)
@@ -105,15 +130,18 @@ func (ar *APIRouter) DeleteHistoryContainer(w http.ResponseWriter, r *http.Reque
 // DeleteHistoryRemoved purges the stored logs of every container that no
 // longer exists on any host. Guarded like DeleteHistoryContainer.
 func (ar *APIRouter) DeleteHistoryRemoved(w http.ResponseWriter, r *http.Request) {
-	if ar.logStore == nil {
-		WriteJsonResponse(w, http.StatusServiceUnavailable, map[string]string{
-			"error": "log persistence is disabled",
-		})
+	store := ar.activeLogStore()
+	if store == nil {
+		disabledResponse(w)
 		return
 	}
 
-	containers, lines, err := ar.logStore.DeleteRemoved(r.Context(), time.Now())
+	containers, lines, err := store.DeleteRemoved(r.Context(), time.Now())
 	if err != nil {
+		if storeClosing(err) {
+			disabledResponse(w)
+			return
+		}
 		log.Printf("history: deleting removed containers failed: %v", err)
 		http.Error(w, "failed to delete stored logs", http.StatusInternalServerError)
 		return
@@ -127,15 +155,18 @@ func (ar *APIRouter) DeleteHistoryRemoved(w http.ResponseWriter, r *http.Request
 }
 
 func (ar *APIRouter) DeleteHistoryAll(w http.ResponseWriter, r *http.Request) {
-	if ar.logStore == nil {
-		WriteJsonResponse(w, http.StatusServiceUnavailable, map[string]string{
-			"error": "log persistence is disabled",
-		})
+	store := ar.activeLogStore()
+	if store == nil {
+		disabledResponse(w)
 		return
 	}
 
-	containers, lines, err := ar.logStore.DeleteAll(r.Context())
+	containers, lines, err := store.DeleteAll(r.Context())
 	if err != nil {
+		if storeClosing(err) {
+			disabledResponse(w)
+			return
+		}
 		log.Printf("history: deleting all stored logs failed: %v", err)
 		http.Error(w, "failed to delete stored logs", http.StatusInternalServerError)
 		return
@@ -175,9 +206,18 @@ func (ar *APIRouter) GetHistoryContainers(w http.ResponseWriter, r *http.Request
 	}
 
 	all := []logstore.StoredContainer{}
-	if ar.logStore != nil {
-		stored, err := ar.logStore.ListContainers(r.Context())
+	if store := ar.activeLogStore(); store != nil {
+		stored, err := store.ListContainers(r.Context())
 		if err != nil {
+			if storeClosing(err) {
+				WriteJsonResponse(w, http.StatusOK, map[string]any{
+					"containers":   []logstore.StoredContainer{},
+					"total":        0,
+					"storedCount":  0,
+					"removedCount": 0,
+				})
+				return
+			}
 			log.Printf("history: listing stored containers failed: %v", err)
 			http.Error(w, "failed to list stored containers", http.StatusInternalServerError)
 			return
@@ -249,10 +289,9 @@ func parseNonNegativeInt(w http.ResponseWriter, params url.Values, name string) 
 // history: follow nextCursor for older lines. A page that hit the scan budget
 // may hold fewer lines than asked, even none, and carries scannedTo.
 func (ar *APIRouter) GetHistoryLogs(w http.ResponseWriter, r *http.Request) {
-	if ar.logStore == nil {
-		WriteJsonResponse(w, http.StatusServiceUnavailable, map[string]string{
-			"error": "log persistence is disabled",
-		})
+	store := ar.activeLogStore()
+	if store == nil {
+		disabledResponse(w)
 		return
 	}
 
@@ -260,8 +299,14 @@ func (ar *APIRouter) GetHistoryLogs(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	page, err := ar.logStore.Query(r.Context(), query)
+	page, err := store.Query(r.Context(), query)
 	if err != nil {
+		// A toggle that closed the store mid-query is a "disabled" answer, not a
+		// server fault.
+		if storeClosing(err) {
+			disabledResponse(w)
+			return
+		}
 		// A bad cursor or an uncompilable pattern is the caller's to fix, so it is
 		// reported verbatim. Anything else is ours: it would leak driver errors and
 		// file paths, so it is logged and answered generically.

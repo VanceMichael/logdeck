@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { SearchIcon, Trash2Icon } from "@/components/ui/icons";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
+import { Switch } from "@/components/ui/switch";
 import { formatBytes } from "@/features/containers/components/container-utils";
 import { ContainersPagination } from "@/features/containers/components/containers-pagination";
 import { Meter } from "@/features/containers/components/meter";
@@ -220,7 +221,14 @@ export function LogStorageSection({
 	readOnly,
 }: LogStorageSectionProps) {
 	const { data: status } = useHistoryStatus();
+	const updateMutation = useUpdateLogStorage();
+	// Runtime truth (the store actually running) gates the data views; the
+	// switch itself follows the configured intent, so after a failed toggle it
+	// snaps back to what the server persisted rather than what was requested.
 	const isEnabled = status?.enabled === true;
+	const envLocked = config?.enabledSource === "env";
+	const switchLocked =
+		!config || envLocked || readOnly || updateMutation.isPending;
 	const [search, setSearch] = useState("");
 	const [page, setPage] = useState(1);
 	const [pageSize, setPageSize] = useState(10);
@@ -246,13 +254,37 @@ export function LogStorageSection({
 	);
 	const [bulkPurge, setBulkPurge] = useState<"removed" | "all" | null>(null);
 
-	// Persistence is off: there is nothing to report or reclaim.
+	const enabledToggle = config ? (
+		<Switch
+			id="log-store-enabled"
+			aria-label="Enable log persistence"
+			checked={config.enabled}
+			disabled={switchLocked}
+			onCheckedChange={(checked) =>
+				updateMutation.mutate({ enabled: checked }, showResultToast)
+			}
+			className="relative after:absolute after:-inset-x-1 after:-inset-y-3"
+		/>
+	) : undefined;
+
+	// Persistence is off: history already on disk is kept, but new logs are not
+	// stored and every history entry is unavailable until it is back on.
 	if (!isEnabled) {
 		return (
 			<SettingsSection
 				title="Log storage"
-				description="Log persistence is off, so nothing is kept on disk. Enable it in the environment and restart LogDeck to keep logs readable after a container is removed."
-			/>
+				description="Keep container logs on disk so they stay readable after a container is removed."
+				badge={envLocked ? <EnvBadge /> : undefined}
+				action={enabledToggle}
+			>
+				<Note>
+					{envLocked
+						? "Pinned by the LOG_STORE_ENABLED environment variable. Change it and restart LogDeck to toggle persistence."
+						: config
+							? "New logs are not being stored. History already on disk is kept: turning persistence back on resumes from the saved position and backfills the gap without duplicates or missing lines."
+							: "Log persistence is off, so nothing is kept on disk. Enable it in the environment and restart LogDeck to keep logs readable after a container is removed."}
+				</Note>
+			</SettingsSection>
 		);
 	}
 
@@ -280,6 +312,8 @@ export function LogStorageSection({
 		<SettingsSection
 			title="Log storage"
 			description="Logs are kept on disk so they stay readable after a container is removed. Deleting a container's history frees its space at once and cannot be undone."
+			badge={envLocked ? <EnvBadge /> : undefined}
+			action={enabledToggle}
 		>
 			<div className="space-y-8">
 				<div className="flex flex-wrap items-center gap-x-8 gap-y-3">

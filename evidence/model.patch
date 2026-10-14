@@ -1,0 +1,1366 @@
+diff --git a/frontend/src/features/containers/hooks/use-history-status.ts b/frontend/src/features/containers/hooks/use-history-status.ts
+index f91476a..dcce078 100644
+--- a/frontend/src/features/containers/hooks/use-history-status.ts
++++ b/frontend/src/features/containers/hooks/use-history-status.ts
+@@ -2,10 +2,11 @@ import { useQuery } from "@tanstack/react-query";
+ 
+ import { getHistoryStatus } from "../api/get-history";
+ 
+-// Whether the server persists logs at all. The answer only changes on a server
+-// restart, so it is fetched once and cached for the session. A failure (older
+-// server without the endpoint) is treated as "not enabled" by the callers,
+-// which read `data?.enabled`.
++// Whether the server currently persists logs. The value is long-lived but it
++// flips the moment persistence is toggled in settings; that mutation
++// invalidates the ["history"] queries, so active observers refetch at once and
++// the rest refetch on mount. A failure (older server without the endpoint) is
++// treated as "not enabled" by the callers, which read `data?.enabled`.
+ export function useHistoryStatus(enabled = true) {
+ 	return useQuery({
+ 		queryKey: ["history", "status"],
+diff --git a/frontend/src/features/settings/components/log-storage-section.tsx b/frontend/src/features/settings/components/log-storage-section.tsx
+index ce39f2d..96892fd 100644
+--- a/frontend/src/features/settings/components/log-storage-section.tsx
++++ b/frontend/src/features/settings/components/log-storage-section.tsx
+@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
+ import { SearchIcon, Trash2Icon } from "@/components/ui/icons";
+ import { Input } from "@/components/ui/input";
+ import { Spinner } from "@/components/ui/spinner";
++import { Switch } from "@/components/ui/switch";
+ import { formatBytes } from "@/features/containers/components/container-utils";
+ import { ContainersPagination } from "@/features/containers/components/containers-pagination";
+ import { Meter } from "@/features/containers/components/meter";
+@@ -220,7 +221,14 @@ export function LogStorageSection({
+ 	readOnly,
+ }: LogStorageSectionProps) {
+ 	const { data: status } = useHistoryStatus();
++	const updateMutation = useUpdateLogStorage();
++	// Runtime truth (the store actually running) gates the data views; the
++	// switch itself follows the configured intent, so after a failed toggle it
++	// snaps back to what the server persisted rather than what was requested.
+ 	const isEnabled = status?.enabled === true;
++	const envLocked = config?.enabledSource === "env";
++	const switchLocked =
++		!config || envLocked || readOnly || updateMutation.isPending;
+ 	const [search, setSearch] = useState("");
+ 	const [page, setPage] = useState(1);
+ 	const [pageSize, setPageSize] = useState(10);
+@@ -246,13 +254,37 @@ export function LogStorageSection({
+ 	);
+ 	const [bulkPurge, setBulkPurge] = useState<"removed" | "all" | null>(null);
+ 
+-	// Persistence is off: there is nothing to report or reclaim.
++	const enabledToggle = config ? (
++		<Switch
++			id="log-store-enabled"
++			aria-label="Enable log persistence"
++			checked={config.enabled}
++			disabled={switchLocked}
++			onCheckedChange={(checked) =>
++				updateMutation.mutate({ enabled: checked }, showResultToast)
++			}
++			className="relative after:absolute after:-inset-x-1 after:-inset-y-3"
++		/>
++	) : undefined;
++
++	// Persistence is off: history already on disk is kept, but new logs are not
++	// stored and every history entry is unavailable until it is back on.
+ 	if (!isEnabled) {
+ 		return (
+ 			<SettingsSection
+ 				title="Log storage"
+-				description="Log persistence is off, so nothing is kept on disk. Enable it in the environment and restart LogDeck to keep logs readable after a container is removed."
+-			/>
++				description="Keep container logs on disk so they stay readable after a container is removed."
++				badge={envLocked ? <EnvBadge /> : undefined}
++				action={enabledToggle}
++			>
++				<Note>
++					{envLocked
++						? "Pinned by the LOG_STORE_ENABLED environment variable. Change it and restart LogDeck to toggle persistence."
++						: config
++							? "New logs are not being stored. History already on disk is kept: turning persistence back on resumes from the saved position and backfills the gap without duplicates or missing lines."
++							: "Log persistence is off, so nothing is kept on disk. Enable it in the environment and restart LogDeck to keep logs readable after a container is removed."}
++				</Note>
++			</SettingsSection>
+ 		);
+ 	}
+ 
+@@ -280,6 +312,8 @@ export function LogStorageSection({
+ 		<SettingsSection
+ 			title="Log storage"
+ 			description="Logs are kept on disk so they stay readable after a container is removed. Deleting a container's history frees its space at once and cannot be undone."
++			badge={envLocked ? <EnvBadge /> : undefined}
++			action={enabledToggle}
+ 		>
+ 			<div className="space-y-8">
+ 				<div className="flex flex-wrap items-center gap-x-8 gap-y-3">
+diff --git a/frontend/src/features/settings/hooks/use-settings.ts b/frontend/src/features/settings/hooks/use-settings.ts
+index de48d8f..4c7315a 100644
+--- a/frontend/src/features/settings/hooks/use-settings.ts
++++ b/frontend/src/features/settings/hooks/use-settings.ts
+@@ -23,7 +23,9 @@ import type { APITokenScope } from "../types";
+ 
+ const SETTINGS_KEY = ["settings"] as const;
+ const API_TOKENS_KEY = ["settings", "api-tokens"] as const;
+-const HISTORY_STATUS_KEY = ["history", "status"] as const;
++// Covers status, the stored-container list, and history pages: a persistence
++// toggle changes the availability of all of them at once.
++const HISTORY_KEY = ["history"] as const;
+ // The container list carries the host set and the read-only flag.
+ const CONTAINERS_KEY = ["containers"] as const;
+ // An open environment panel is routed by whether its host has a connection.
+@@ -95,15 +97,16 @@ export function useUpdateReadOnly() {
+ 	});
+ }
+ 
+-// The usage bar and the per-container cap text read their limits from
+-// /history/status, so that query is invalidated alongside the settings.
++// Toggling persistence starts/stops the server's store, so every history query
++// (status gates the UI; the lists and pages read it) is invalidated together
++// with the settings.
+ export function useUpdateLogStorage() {
+ 	const queryClient = useQueryClient();
+ 	return useMutation({
+ 		mutationFn: (payload: UpdateLogStoragePayload) => updateLogStorage(payload),
+ 		onSuccess: () => {
+ 			queryClient.invalidateQueries({ queryKey: SETTINGS_KEY });
+-			queryClient.invalidateQueries({ queryKey: HISTORY_STATUS_KEY });
++			queryClient.invalidateQueries({ queryKey: HISTORY_KEY });
+ 		},
+ 	});
+ }
+diff --git a/server/cmd/server/main.go b/server/cmd/server/main.go
+index 80aae9d..b50afc9 100644
+--- a/server/cmd/server/main.go
++++ b/server/cmd/server/main.go
+@@ -74,13 +74,28 @@ func main() {
+ 		log.Println("Coolify integration is DISABLED")
+ 	}
+ 
++	// The process lifecycle context. It is created before the long-lived
++	// components so each can bind its own cancellable children to it (the log
++	// store toggles its pipeline at runtime, but always drains when this ends).
++	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
++	defer stop()
++	// Once the first signal starts the graceful shutdown, restore default
++	// signal handling so a second Ctrl-C terminates the process immediately.
++	go func() {
++		<-ctx.Done()
++		stop()
++	}()
++
+ 	registry := services.NewRegistry(multiHostClient, coolifyClient, authService, cfg)
+ 
+ 	logHub := logstream.New(registry)
+ 	alertEngine := alerts.NewEngine(registry, manager, logHub)
+-	// logStore is nil when persistence is disabled or its database is
+-	// unusable; every consumer must treat that as "no stored logs".
+-	logStore := logstore.OpenFromConfig(manager)
++	// logStoreCtl owns the optional persistence pipeline and its runtime
++	// toggling. A nil current store (disabled or unusable database) means
++	// "no stored logs" for every consumer.
++	logStoreCtl := logstore.NewController(ctx, manager, logHub, func() logstore.Engine {
++		return registry.Docker()
++	})
+ 
+ 	manager.OnChange(func(newCfg *config.Config) {
+ 		registry.UpdateConfig(newCfg)
+@@ -114,7 +129,7 @@ func main() {
+ 		log.Println("Configuration reloaded successfully")
+ 	})
+ 
+-	apiRouter := api.NewRouter(registry, manager, alertEngine, logStore, version)
++	apiRouter := api.NewRouter(registry, manager, alertEngine, logStoreCtl, version)
+ 
+ 	// No WriteTimeout/IdleTimeout: log streaming and terminal WebSockets are
+ 	// long-lived connections and would be killed by them. ReadTimeout only
+@@ -127,23 +142,16 @@ func main() {
+ 		ReadTimeout:       30 * time.Second,
+ 	}
+ 
+-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+-	defer stop()
+ 	// Request contexts end with ctx, so open log and event streams close on
+ 	// shutdown instead of holding it until Docker kills the process.
+ 	server.BaseContext = func(net.Listener) context.Context { return ctx }
+-	// Once the first signal starts the graceful shutdown, restore default
+-	// signal handling so a second Ctrl-C terminates the process immediately.
+-	go func() {
+-		<-ctx.Done()
+-		stop()
+-	}()
+ 
+ 	go logHub.Run(ctx)
+ 	alertEngine.Start(ctx)
+-	if logStore != nil {
+-		logStore.Start(ctx, logHub, registry)
+-	}
++	// Subscribe only once the hub run loop is serving: the hub's Subscribe
++	// blocks until then. A disabled config or an unusable database leaves the
++	// controller empty; runtime toggles go through it afterwards.
++	logStoreCtl.Bootstrap()
+ 
+ 	// PPROF_ADDR=127.0.0.1:6060 exposes Go runtime profiles (heap, goroutines)
+ 	// on a separate listener. Off unless set. The profiles are unauthenticated,
+@@ -177,10 +185,5 @@ func main() {
+ 	// hub, so its final batch can only be complete once the hub has stopped.
+ 	alertEngine.Wait()
+ 	logHub.Wait()
+-	if logStore != nil {
+-		logStore.Wait()
+-		if err := logStore.Close(); err != nil {
+-			log.Printf("Closing the log store failed: %v", err)
+-		}
+-	}
++	logStoreCtl.Shutdown()
+ }
+diff --git a/server/internal/api/history_handlers.go b/server/internal/api/history_handlers.go
+index bcd53a9..9cb6378 100644
+--- a/server/internal/api/history_handlers.go
++++ b/server/internal/api/history_handlers.go
+@@ -1,6 +1,7 @@
+ package api
+ 
+ import (
++	"database/sql"
+ 	"errors"
+ 	"fmt"
+ 	"log"
+@@ -17,6 +18,22 @@ import (
+ 	"github.com/go-chi/chi/v5"
+ )
+ 
++// disabledResponse is the body every history entry returns while persistence
++// is off (including the instant a runtime toggle flips it).
++func disabledResponse(w http.ResponseWriter) {
++	WriteJsonResponse(w, http.StatusServiceUnavailable, map[string]string{
++		"error": "log persistence is disabled",
++	})
++}
++
++// storeClosing reports whether a call lost the race with a disable that closed
++// the database pool. database/sql closes safely concurrently with in-flight
++// calls but hands these errors to a call started around the close; such a
++// request is answered as "disabled", not as a server fault.
++func storeClosing(err error) bool {
++	return errors.Is(err, sql.ErrConnDone) || strings.Contains(err.Error(), "database is closed")
++}
++
+ // validHistoryLevels are the level names accepted by the history log filter.
+ // UNKNOWN is included: unclassified lines are stored under it and a user may
+ // legitimately want to look at them.
+@@ -38,7 +55,8 @@ var validHistoryLevels = map[string]bool{
+ // With persistence disabled the response carries "enabled": false and nothing
+ // else: there is no database to size and the caps are not in force.
+ func (ar *APIRouter) GetHistoryStatus(w http.ResponseWriter, r *http.Request) {
+-	if ar.logStore == nil {
++	store := ar.activeLogStore()
++	if store == nil {
+ 		WriteJsonResponse(w, http.StatusOK, map[string]any{"enabled": false})
+ 		return
+ 	}
+@@ -46,8 +64,12 @@ func (ar *APIRouter) GetHistoryStatus(w http.ResponseWriter, r *http.Request) {
+ 	// A failed stat is reported as a zero size rather than a 500: the status
+ 	// endpoint gates History mode in the frontend, and the store works whether
+ 	// or not its file can be measured.
+-	size, err := ar.logStore.DBSize()
++	size, err := store.DBSize()
+ 	if err != nil {
++		if storeClosing(err) {
++			WriteJsonResponse(w, http.StatusOK, map[string]any{"enabled": false})
++			return
++		}
+ 		log.Printf("history: measuring the log database failed: %v", err)
+ 	}
+ 
+@@ -65,10 +87,9 @@ func (ar *APIRouter) GetHistoryStatus(w http.ResponseWriter, r *http.Request) {
+ // read-scoped API tokens and blocked in read-only mode (see
+ // registerHistoryRoutes).
+ func (ar *APIRouter) DeleteHistoryContainer(w http.ResponseWriter, r *http.Request) {
+-	if ar.logStore == nil {
+-		WriteJsonResponse(w, http.StatusServiceUnavailable, map[string]string{
+-			"error": "log persistence is disabled",
+-		})
++	store := ar.activeLogStore()
++	if store == nil {
++		disabledResponse(w)
+ 		return
+ 	}
+ 
+@@ -85,12 +106,16 @@ func (ar *APIRouter) DeleteHistoryContainer(w http.ResponseWriter, r *http.Reque
+ 		return
+ 	}
+ 
+-	deleted, err := ar.logStore.DeleteContainer(r.Context(), host, name)
++	deleted, err := store.DeleteContainer(r.Context(), host, name)
+ 	if err != nil {
+ 		if errors.Is(err, logstore.ErrContainerNotFound) {
+ 			http.Error(w, "no stored logs for this container", http.StatusNotFound)
+ 			return
+ 		}
++		if storeClosing(err) {
++			disabledResponse(w)
++			return
++		}
+ 		log.Printf("history: deleting stored logs failed: %v", err)
+ 		http.Error(w, "failed to delete stored logs", http.StatusInternalServerError)
+ 		return
+@@ -105,15 +130,18 @@ func (ar *APIRouter) DeleteHistoryContainer(w http.ResponseWriter, r *http.Reque
+ // DeleteHistoryRemoved purges the stored logs of every container that no
+ // longer exists on any host. Guarded like DeleteHistoryContainer.
+ func (ar *APIRouter) DeleteHistoryRemoved(w http.ResponseWriter, r *http.Request) {
+-	if ar.logStore == nil {
+-		WriteJsonResponse(w, http.StatusServiceUnavailable, map[string]string{
+-			"error": "log persistence is disabled",
+-		})
++	store := ar.activeLogStore()
++	if store == nil {
++		disabledResponse(w)
+ 		return
+ 	}
+ 
+-	containers, lines, err := ar.logStore.DeleteRemoved(r.Context(), time.Now())
++	containers, lines, err := store.DeleteRemoved(r.Context(), time.Now())
+ 	if err != nil {
++		if storeClosing(err) {
++			disabledResponse(w)
++			return
++		}
+ 		log.Printf("history: deleting removed containers failed: %v", err)
+ 		http.Error(w, "failed to delete stored logs", http.StatusInternalServerError)
+ 		return
+@@ -127,15 +155,18 @@ func (ar *APIRouter) DeleteHistoryRemoved(w http.ResponseWriter, r *http.Request
+ }
+ 
+ func (ar *APIRouter) DeleteHistoryAll(w http.ResponseWriter, r *http.Request) {
+-	if ar.logStore == nil {
+-		WriteJsonResponse(w, http.StatusServiceUnavailable, map[string]string{
+-			"error": "log persistence is disabled",
+-		})
++	store := ar.activeLogStore()
++	if store == nil {
++		disabledResponse(w)
+ 		return
+ 	}
+ 
+-	containers, lines, err := ar.logStore.DeleteAll(r.Context())
++	containers, lines, err := store.DeleteAll(r.Context())
+ 	if err != nil {
++		if storeClosing(err) {
++			disabledResponse(w)
++			return
++		}
+ 		log.Printf("history: deleting all stored logs failed: %v", err)
+ 		http.Error(w, "failed to delete stored logs", http.StatusInternalServerError)
+ 		return
+@@ -175,9 +206,18 @@ func (ar *APIRouter) GetHistoryContainers(w http.ResponseWriter, r *http.Request
+ 	}
+ 
+ 	all := []logstore.StoredContainer{}
+-	if ar.logStore != nil {
+-		stored, err := ar.logStore.ListContainers(r.Context())
++	if store := ar.activeLogStore(); store != nil {
++		stored, err := store.ListContainers(r.Context())
+ 		if err != nil {
++			if storeClosing(err) {
++				WriteJsonResponse(w, http.StatusOK, map[string]any{
++					"containers":   []logstore.StoredContainer{},
++					"total":        0,
++					"storedCount":  0,
++					"removedCount": 0,
++				})
++				return
++			}
+ 			log.Printf("history: listing stored containers failed: %v", err)
+ 			http.Error(w, "failed to list stored containers", http.StatusInternalServerError)
+ 			return
+@@ -249,10 +289,9 @@ func parseNonNegativeInt(w http.ResponseWriter, params url.Values, name string)
+ // history: follow nextCursor for older lines. A page that hit the scan budget
+ // may hold fewer lines than asked, even none, and carries scannedTo.
+ func (ar *APIRouter) GetHistoryLogs(w http.ResponseWriter, r *http.Request) {
+-	if ar.logStore == nil {
+-		WriteJsonResponse(w, http.StatusServiceUnavailable, map[string]string{
+-			"error": "log persistence is disabled",
+-		})
++	store := ar.activeLogStore()
++	if store == nil {
++		disabledResponse(w)
+ 		return
+ 	}
+ 
+@@ -260,8 +299,14 @@ func (ar *APIRouter) GetHistoryLogs(w http.ResponseWriter, r *http.Request) {
+ 	if !ok {
+ 		return
+ 	}
+-	page, err := ar.logStore.Query(r.Context(), query)
++	page, err := store.Query(r.Context(), query)
+ 	if err != nil {
++		// A toggle that closed the store mid-query is a "disabled" answer, not a
++		// server fault.
++		if storeClosing(err) {
++			disabledResponse(w)
++			return
++		}
+ 		// A bad cursor or an uncompilable pattern is the caller's to fix, so it is
+ 		// reported verbatim. Anything else is ours: it would leak driver errors and
+ 		// file paths, so it is logged and answered generically.
+diff --git a/server/internal/api/history_handlers_test.go b/server/internal/api/history_handlers_test.go
+index 321bfc3..ea058ce 100644
+--- a/server/internal/api/history_handlers_test.go
++++ b/server/internal/api/history_handlers_test.go
+@@ -23,6 +23,12 @@ import (
+ 
+ var historyBase = time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+ 
++// staticLogStores is a non-toggling provider for handler tests that own a
++// store's lifecycle directly.
++type staticLogStores struct{ store *logstore.Store }
++
++func (s staticLogStores) CurrentStore() *logstore.Store { return s.store }
++
+ // newHistoryTestRouter builds a router around the given store (nil means log
+ // persistence is disabled) with auth off.
+ func newHistoryTestRouter(t *testing.T, store *logstore.Store) http.Handler {
+@@ -43,7 +49,11 @@ func newHistoryTestRouterWithAuth(t *testing.T, store *logstore.Store, authSvc *
+ 	manager := config.NewManager()
+ 	registry := services.NewRegistry(nil, nil, authSvc, manager.Config())
+ 	engine := alerts.NewEngine(registry, manager, nil)
+-	return NewRouter(registry, manager, engine, store, "test")
++	var provider logStoreProvider
++	if store != nil {
++		provider = staticLogStores{store: store}
++	}
++	return NewRouter(registry, manager, engine, provider, "test")
+ }
+ 
+ // newHistoryStore opens a real store over a temp database and returns it with
+@@ -759,7 +769,7 @@ func TestDeleteHistoryContainerReadOnlyMode(t *testing.T) {
+ 
+ 	manager := config.NewManager()
+ 	registry := services.NewRegistry(nil, nil, nil, manager.Config())
+-	router := NewRouter(registry, manager, alerts.NewEngine(registry, manager, nil), store, "test")
++	router := NewRouter(registry, manager, alerts.NewEngine(registry, manager, nil), staticLogStores{store: store}, "test")
+ 
+ 	w := doHistoryDelete(t, router, "/api/v1/history/containers/web?host=local", "")
+ 	if w.Code != http.StatusForbidden {
+diff --git a/server/internal/api/router.go b/server/internal/api/router.go
+index 47b1661..7bda9d1 100644
+--- a/server/internal/api/router.go
++++ b/server/internal/api/router.go
+@@ -1,6 +1,7 @@
+ package api
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"log"
+ 	"net/http"
+@@ -18,33 +19,60 @@ import (
+ 	"github.com/go-chi/cors"
+ )
+ 
++// logStoreProvider supplies the running log store. *logstore.Controller is the
++// production implementation; its pointer changes when persistence is toggled
++// at runtime. A nil provider (used by stripped builds and unit tests) behaves
++// as "persistence is off".
++type logStoreProvider interface {
++	CurrentStore() *logstore.Store
++}
++
++// logStoreLifecycle drives the runtime toggle. Split from logStoreProvider so
++// the read-only history routes only depend on the lookup they need.
++type logStoreLifecycle interface {
++	logStoreProvider
++	Enable(ctx context.Context, commit func() error) error
++	Disable(commit func() error) error
++}
++
+ type APIRouter struct {
+ 	router   *chi.Mux
+ 	registry *services.Registry
+ 	manager  *config.Manager
+ 	engine   *alerts.Engine
+-	// logStore is nil when log persistence is disabled or unusable.
+-	logStore *logstore.Store
+-	version  string
++	// logStores is nil (or returns nil) when log persistence is disabled or
++	// unusable.
++	logStores logStoreProvider
++	version   string
+ 
+ 	// machineHostname caches the engine-reported hostname; see GetSystemStats.
+ 	machineHostnameMu sync.Mutex
+ 	machineHostname   string
+ }
+ 
+-func NewRouter(registry *services.Registry, manager *config.Manager, engine *alerts.Engine, logStore *logstore.Store, version string) *chi.Mux {
++func NewRouter(registry *services.Registry, manager *config.Manager, engine *alerts.Engine, logStores logStoreProvider, version string) *chi.Mux {
+ 	r := &APIRouter{
+-		router:   chi.NewRouter(),
+-		registry: registry,
+-		manager:  manager,
+-		engine:   engine,
+-		logStore: logStore,
+-		version:  version,
++		router:    chi.NewRouter(),
++		registry:  registry,
++		manager:   manager,
++		engine:    engine,
++		logStores: logStores,
++		version:   version,
+ 	}
+ 
+ 	return r.Routes()
+ }
+ 
++// activeLogStore returns the currently running store, or nil when persistence
++// is off. Resolved per request so a runtime toggle takes effect immediately
++// for every subsequent request.
++func (ar *APIRouter) activeLogStore() *logstore.Store {
++	if ar.logStores == nil {
++		return nil
++	}
++	return ar.logStores.CurrentStore()
++}
++
+ func WriteJsonResponse(w http.ResponseWriter, status int, data any) {
+ 	payload, err := json.Marshal(data)
+ 	if err != nil {
+diff --git a/server/internal/api/settings_handlers.go b/server/internal/api/settings_handlers.go
+index f3a2daf..bb0e8b7 100644
+--- a/server/internal/api/settings_handlers.go
++++ b/server/internal/api/settings_handlers.go
+@@ -16,6 +16,7 @@ import (
+ 	"github.com/AmoabaKelvin/logdeck/internal/config"
+ 	"github.com/AmoabaKelvin/logdeck/internal/coolify"
+ 	"github.com/AmoabaKelvin/logdeck/internal/docker"
++	"github.com/AmoabaKelvin/logdeck/internal/logstore"
+ )
+ 
+ const secretMask = "••••••••"
+@@ -261,7 +262,10 @@ const maxLogStoreRemovedDays = 3650
+ 
+ // UpdateLogStorage handles PUT /api/v1/settings/log-storage. Every field is
+ // optional; only the ones provided change. The janitor re-reads the caps on
+-// each pass, so a new cap takes effect without a restart.
++// each pass, so a new cap takes effect without a restart. Toggling enabled
++// starts or stops the whole persistence pipeline through the log store
++// controller, and the config commit is coordinated with that transition so a
++// failure never leaves config and runtime disagreeing.
+ func (ar *APIRouter) UpdateLogStorage(w http.ResponseWriter, r *http.Request) {
+ 	var req struct {
+ 		Enabled        *bool `json:"enabled"`
+@@ -311,7 +315,7 @@ func (ar *APIRouter) UpdateLogStorage(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	err := ar.manager.UpdateLogStore(func(current config.LogStoreConfig) (config.LogStoreConfig, error) {
++	mutate := func(current config.LogStoreConfig) (config.LogStoreConfig, error) {
+ 		if req.Enabled != nil {
+ 			current.Enabled = req.Enabled
+ 		}
+@@ -325,9 +329,34 @@ func (ar *APIRouter) UpdateLogStorage(w http.ResponseWriter, r *http.Request) {
+ 			current.RemovedDays = req.RemovedDays
+ 		}
+ 		return current, nil
+-	})
++	}
++	commit := func() error { return ar.manager.UpdateLogStore(mutate) }
++
++	// Drive the runtime transition when the enabled flag actually flips relative
++	// to the running pipeline. Comparing against the runtime (not the file
++	// value) also self-heals a start whose database failed to open: repeating
++	// "enabled" retries the start instead of reporting a hollow 200.
++	running := ar.activeLogStore() != nil
++	var err error
++	switch lifecycle, _ := ar.logStores.(logStoreLifecycle); {
++	case lifecycle == nil:
++		// No runtime owner wired in (unit builds): persist the value only.
++		err = commit()
++	case req.Enabled != nil && *req.Enabled && !running:
++		err = lifecycle.Enable(r.Context(), commit)
++	case req.Enabled != nil && !*req.Enabled && running:
++		err = lifecycle.Disable(commit)
++	default:
++		err = commit()
++	}
+ 	if err != nil {
+-		http.Error(w, err.Error(), settingsErrorStatus(err))
++		// A store that could not be opened/stopped is a degraded service, not a
++		// bad request: surface 503 with the cause instead of a misleading 200.
++		status := settingsErrorStatus(err)
++		if errors.Is(err, logstore.ErrStoreUnavailable) {
++			status = http.StatusServiceUnavailable
++		}
++		http.Error(w, err.Error(), status)
+ 		return
+ 	}
+ 
+diff --git a/server/internal/api/settings_logstore_toggle_test.go b/server/internal/api/settings_logstore_toggle_test.go
+new file mode 100644
+index 0000000..4181efe
+--- /dev/null
++++ b/server/internal/api/settings_logstore_toggle_test.go
+@@ -0,0 +1,202 @@
++package api
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"github.com/AmoabaKelvin/logdeck/internal/config"
++	"github.com/AmoabaKelvin/logdeck/internal/docker"
++	"github.com/AmoabaKelvin/logdeck/internal/logstore"
++	"github.com/AmoabaKelvin/logdeck/internal/logstream"
++	"github.com/AmoabaKelvin/logdeck/internal/models"
++	"github.com/AmoabaKelvin/logdeck/internal/services"
++)
++
++// toggleHub is the minimal Hub the controller accepts; it only records whether
++// the store's subscription is currently attached.
++type toggleHub struct{ active atomic.Bool }
++
++func (h *toggleHub) Subscribe(_ logstream.ContainerSpec, _ models.LogOptions, _ func(logstream.Record)) func() {
++	h.active.Store(true)
++	return func() { h.active.Store(false) }
++}
++
++// toggleEngine lists nothing and tails nothing: lifecycle transitions are what
++// these tests exercise, not ingestion.
++type toggleEngine struct{}
++
++func (toggleEngine) ListContainersAllHosts(context.Context) (map[string][]models.ContainerInfo, []docker.HostError, error) {
++	return map[string][]models.ContainerInfo{"local": {}}, nil, nil
++}
++
++func (toggleEngine) TailContainerLogs(context.Context, string, string, models.LogOptions, func(models.LogEntry)) error {
++	return nil
++}
++
++// newToggleRouter wires a router to a real log store controller over a temp
++// config path. The controller starts empty (no Bootstrap), like a service that
++// booted with persistence disabled.
++func newToggleRouter(t *testing.T, configPath string) (http.Handler, *config.Manager, *logstore.Controller, *toggleHub) {
++	t.Helper()
++	for _, key := range []string{
++		"JWT_SECRET", "ADMIN_USERNAME", "ADMIN_PASSWORD", "ADMIN_PASSWORD_SALT",
++		"DOCKER_HOSTS", "COOLIFY_CONFIGS", "READONLY_MODE", "CORS_ALLOWED_ORIGINS",
++		"LOG_STORE_ENABLED", "LOG_STORE_PER_CONTAINER_MB", "LOG_STORE_TOTAL_MB",
++		"LOG_STORE_REMOVED_DAYS",
++	} {
++		t.Setenv(key, "")
++	}
++	t.Setenv("CONFIG_PATH", configPath)
++
++	manager := config.NewManager()
++	registry := services.NewRegistry(nil, nil, nil, manager.Config())
++	hub := &toggleHub{}
++	ctx, cancel := context.WithCancel(context.Background())
++	t.Cleanup(cancel)
++	engine := toggleEngine{}
++	ctl := logstore.NewController(ctx, manager, hub, func() logstore.Engine { return engine })
++	t.Cleanup(ctl.Shutdown)
++	return NewRouter(registry, manager, nil, ctl, "test"), manager, ctl, hub
++}
++
++func doRequest(t *testing.T, router http.Handler, method, target, body string) *httptest.ResponseRecorder {
++	t.Helper()
++	var payload io.Reader
++	if body != "" {
++		payload = strings.NewReader(body)
++	}
++	r := httptest.NewRequest(method, target, payload)
++	if body != "" {
++		r.Header.Set("Content-Type", "application/json")
++	}
++	w := httptest.NewRecorder()
++	router.ServeHTTP(w, r)
++	return w
++}
++
++func TestUpdateLogStorageTogglesRuntime(t *testing.T) {
++	router, manager, ctl, hub := newToggleRouter(t, filepath.Join(t.TempDir(), "config.json"))
++
++	if ctl.CurrentStore() != nil {
++		t.Fatal("controller should start empty")
++	}
++
++	// Enable from settings: the response must mean the store is actually open.
++	w := doRequest(t, router, http.MethodPut, "/api/v1/settings/log-storage", `{"enabled":true}`)
++	if w.Code != http.StatusOK {
++		t.Fatalf("enable = %d, want 200: %s", w.Code, w.Body.String())
++	}
++	if ctl.CurrentStore() == nil || !hub.active.Load() {
++		t.Fatal("enabled response with no running, subscribed store")
++	}
++	if !manager.LogStore().Enabled {
++		t.Fatal("config not persisted enabled")
++	}
++
++	w = doRequest(t, router, http.MethodGet, "/api/v1/history/status", "")
++	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"enabled":true`) {
++		t.Fatalf("history status = %d %s, want enabled", w.Code, w.Body.String())
++	}
++
++	// Disable: history state and every query entry go unavailable at once.
++	w = doRequest(t, router, http.MethodPut, "/api/v1/settings/log-storage", `{"enabled":false}`)
++	if w.Code != http.StatusOK {
++		t.Fatalf("disable = %d, want 200: %s", w.Code, w.Body.String())
++	}
++	if ctl.CurrentStore() != nil || hub.active.Load() {
++		t.Fatal("store still running or subscribed after disable")
++	}
++	if manager.LogStore().Enabled {
++		t.Fatal("config not persisted disabled")
++	}
++
++	w = doRequest(t, router, http.MethodGet, "/api/v1/history/status", "")
++	if !strings.Contains(w.Body.String(), `"enabled":false`) {
++		t.Fatalf("status after disable = %s, want enabled:false", w.Body.String())
++	}
++	if w := doRequest(t, router, http.MethodGet, "/api/v1/history/logs?container=web", ""); w.Code != http.StatusServiceUnavailable {
++		t.Fatalf("history query after disable = %d, want 503", w.Code)
++	}
++	if w := doRequest(t, router, http.MethodDelete, "/api/v1/history/containers/web?host=local", ""); w.Code != http.StatusServiceUnavailable {
++		t.Fatalf("history purge after disable = %d, want 503", w.Code)
++	}
++
++	// Re-enable reopens the same database and reattaches the subscription.
++	w = doRequest(t, router, http.MethodPut, "/api/v1/settings/log-storage", `{"enabled":true}`)
++	if w.Code != http.StatusOK {
++		t.Fatalf("re-enable = %d, want 200: %s", w.Code, w.Body.String())
++	}
++	if ctl.CurrentStore() == nil || !hub.active.Load() {
++		t.Fatal("store not restarted on re-enable")
++	}
++	w = doRequest(t, router, http.MethodGet, "/api/v1/history/status", "")
++	if !strings.Contains(w.Body.String(), `"enabled":true`) {
++		t.Fatalf("status after re-enable = %s, want enabled:true", w.Body.String())
++	}
++}
++
++func TestUpdateLogStorageRejectsEnvPinnedEnabled(t *testing.T) {
++	router, _, ctl, _ := newToggleRouter(t, filepath.Join(t.TempDir(), "config.json"))
++	t.Setenv("LOG_STORE_ENABLED", "false")
++
++	w := doRequest(t, router, http.MethodPut, "/api/v1/settings/log-storage", `{"enabled":true}`)
++	if w.Code != http.StatusConflict {
++		t.Fatalf("PUT = %d, want 409 for an env-pinned enabled flag: %s", w.Code, w.Body.String())
++	}
++	if ctl.CurrentStore() != nil {
++		t.Fatal("env-pinned toggle must not start a store")
++	}
++}
++
++// A store that cannot be opened is a degraded service: the API must report it
++// instead of answering 200, the config stays unchanged, and the same request
++// succeeds once the fault clears.
++func TestUpdateLogStorageEnableFailureIs503AndRetryable(t *testing.T) {
++	dir := t.TempDir()
++	configPath := filepath.Join(dir, "config.json")
++	router, _, ctl, _ := newToggleRouter(t, configPath)
++
++	// A corrupt database beside the config makes Open fail at schema init,
++	// without affecting the config file itself.
++	corrupt := filepath.Join(dir, "logs.db")
++	if err := os.WriteFile(corrupt, []byte("this is not a sqlite database"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++
++	w := doRequest(t, router, http.MethodPut, "/api/v1/settings/log-storage", `{"enabled":true}`)
++	if w.Code != http.StatusServiceUnavailable {
++		t.Fatalf("enable against a corrupt database = %d, want 503: %s", w.Code, w.Body.String())
++	}
++	if ctl.CurrentStore() != nil {
++		t.Fatal("failed enable must not publish a store")
++	}
++
++	// Fault clears (the corrupt file is removed), the same operation retries.
++	if err := os.Remove(corrupt); err != nil {
++		t.Fatal(err)
++	}
++	w = doRequest(t, router, http.MethodPut, "/api/v1/settings/log-storage", `{"enabled":true}`)
++	if w.Code != http.StatusOK {
++		t.Fatalf("retry after the fault cleared = %d, want 200: %s", w.Code, w.Body.String())
++	}
++	if ctl.CurrentStore() == nil {
++		t.Fatal("retry did not start the store")
++	}
++}
++
++func TestUpdateLogStorageToggleDuringShutdownUnavailable(t *testing.T) {
++	router, _, ctl, _ := newToggleRouter(t, filepath.Join(t.TempDir(), "config.json"))
++	ctl.Shutdown()
++
++	w := doRequest(t, router, http.MethodPut, "/api/v1/settings/log-storage", `{"enabled":true}`)
++	if w.Code != http.StatusServiceUnavailable {
++		t.Fatalf("enable during shutdown = %d, want 503: %s", w.Code, w.Body.String())
++	}
++}
+diff --git a/server/internal/logstore/controller.go b/server/internal/logstore/controller.go
+new file mode 100644
+index 0000000..48a94bc
+--- /dev/null
++++ b/server/internal/logstore/controller.go
+@@ -0,0 +1,248 @@
++package logstore
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"log"
++	"sync"
++
++	"github.com/AmoabaKelvin/logdeck/internal/config"
++)
++
++// ErrStoreUnavailable marks a toggle failure where persistence could not be
++// made operational: the database would not open (or the process is shutting
++// down). The settings API answers 503 with this error instead of masking the
++// degradation with a 200; the same request succeeds once retried after the
++// underlying fault is gone.
++var ErrStoreUnavailable = errors.New("log persistence is unavailable")
++
++// Controller owns the optional Store for the lifetime of a process and drives
++// its start/stop lifecycle when the "logStore.enabled" setting is toggled at
++// runtime. The Store itself is a one-shot pipeline (channels, WaitGroups, and
++// its hub subscription are not reusable), so every transition creates a fresh
++// Store and the previous one is joined and closed exactly once.
++//
++// Invariants:
++//
++//   - Transitions are serialized by one mutex: concurrent or duplicate toggle
++//     requests run one at a time, and a request that matches the running state
++//     allocates no Store, goroutine, subscription, or database handle.
++//   - On disable the running Store is unpublished and its lifecycle context is
++//     cancelled in the same locked step, after which its hub sink is never
++//     invoked again; Disable only returns once in-flight writes are flushed and
++//     the sync/backfill/janitor goroutines and both SQLite handles are stopped.
++//   - On enable the original database is reopened and the hub subscription and
++//     engine backfill attached before the change is reported. The persisted
++//     watermarks and the writer's insert-time dedup then heal the whole
++//     disabled interval, including its boundaries, without repeats or gaps.
++//   - The config commit is interleaved with the runtime transition, so a
++//     failed open, teardown, or config write cannot leave the persisted value
++//     and the running state disagreeing. Every failed path stays retryable.
++type Controller struct {
++	parent  context.Context
++	manager *config.Manager
++	hub     Hub
++	// source yields the current engine; read indirectly on every sync pass so
++	// the Store keeps working across hot-swapped Docker clients.
++	source func() Engine
++
++	mu      sync.Mutex
++	running *Store
++	cancel  context.CancelFunc
++	closed  bool
++}
++
++// NewController builds the runtime owner. parent bounds every Store the
++// controller starts: when it is cancelled the active Store drains on its own,
++// and Shutdown then joins and closes it.
++func NewController(parent context.Context, manager *config.Manager, hub Hub, source func() Engine) *Controller {
++	return &Controller{
++		parent:  parent,
++		manager: manager,
++		hub:     hub,
++		source:  source,
++	}
++}
++
++// CurrentStore returns the running store, or nil when persistence is off. The
++// pointer is per-request: a concurrent toggle may stop and close it, and
++// database/sql makes using a closing pool safe (the call returns an error the
++// API maps to "disabled") rather than racing.
++func (c *Controller) CurrentStore() *Store {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.running
++}
++
++// Bootstrap starts the Store when the resolved configuration has persistence
++// enabled. It keeps OpenFromConfig's tolerant startup contract: a disabled
++// config, or an unusable database, logs a warning and leaves the controller
++// empty so the rest of the server runs without stored logs.
++func (c *Controller) Bootstrap() {
++	store := OpenFromConfig(c.manager)
++	if store == nil {
++		return
++	}
++
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.closed || c.parent.Err() != nil {
++		if err := store.Close(); err != nil {
++			log.Printf("logstore: closing the unused store failed: %v", err)
++		}
++		return
++	}
++
++	ctx, cancel := context.WithCancel(c.parent)
++	store.start(ctx, c.hub, c.source)
++	c.running, c.cancel = store, cancel
++}
++
++// Enable opens the database and starts the ingestion pipeline BEFORE running
++// commit, so the prepared pipeline can be torn back down when the config write
++// fails. The new Store is only published once commit succeeded, hence every
++// successful response already sees status, query endpoints, and MCP enabled,
++// and every failed response leaves config and runtime both disabled.
++//
++// Re-enabling reopens the same file: the new Store snapshots the persisted
++// per-generation watermarks and the sync loop backfills the disabled interval
++// with an overlap, while the writer deduplicates overlapping reads.
++func (c *Controller) Enable(ctx context.Context, commit func() error) error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	if c.closed || c.parent.Err() != nil || ctx.Err() != nil {
++		return fmt.Errorf("%w: server is shutting down", ErrStoreUnavailable)
++	}
++	if c.running != nil {
++		// Idempotent duplicate: the runtime already matches the request, so the
++		// config commit is the only work left (caps may accompany the toggle).
++		return commit()
++	}
++
++	store, cancel, err := c.openStartLocked()
++	if err != nil {
++		return err
++	}
++
++	if commitErr := commit(); commitErr != nil {
++		// Config stayed disabled: discard the prepared pipeline before it can
++		// be observed, and leave no goroutine, subscription, or handle behind.
++		cancel()
++		store.Wait()
++		if closeErr := store.Close(); closeErr != nil {
++			log.Printf("logstore: closing the store after a failed enable failed: %v", closeErr)
++		}
++		return commitErr
++	}
++
++	c.running, c.cancel = store, cancel
++	log.Printf("Log persistence is ENABLED (%s)", store.path)
++	return nil
++}
++
++// Disable unpublishes the Store and blocks new persistence input in one locked
++// step: the Store's shutdown coordinator drops the hub subscription as soon as
++// it observes the cancellation, after which the sink is never called again.
++// The disabled config is committed next (while the pipeline drains), so
++// settings and status can never be observed disagreeing; Disable only returns
++// after in-flight backfills and the final writer batch have completed and both
++// SQLite handles are closed. The on-disk history itself is untouched.
++//
++// commit runs while the transition lock is held. When it fails the in-memory
++// config has already rolled back to enabled, so Disable converges the runtime
++// back to it by reopening a fresh Store; the response still reports the
++// failure and the operation can be retried.
++func (c *Controller) Disable(commit func() error) error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	if c.closed {
++		return fmt.Errorf("%w: server is shutting down", ErrStoreUnavailable)
++	}
++
++	old, stop := c.running, c.cancel
++	if old == nil {
++		// Runtime is already disabled; just make the config agree.
++		return commit()
++	}
++
++	// Immediate, atomic user-visible flip + input cut-off.
++	c.running, c.cancel = nil, nil
++	stop()
++
++	// Persist the disabled intent while the pipeline drains in the background:
++	// from here on status AND settings report disabled, so an observer can never
++	// catch the two disagreeing. The database file itself stays untouched.
++	if err := commit(); err != nil {
++		// The persisted config stayed enabled: let the cancelled Store finish
++		// draining, release its handles, and reopen a fresh Store so runtime and
++		// config converge.
++		old.Wait()
++		closeErr := old.Close()
++		store, cancel, reopenErr := c.openStartLocked()
++		if reopenErr != nil {
++			if closeErr != nil {
++				log.Printf("logstore: closing the old store after a failed disable failed: %v", closeErr)
++			}
++			return errors.Join(err, reopenErr)
++		}
++		if closeErr != nil {
++			log.Printf("logstore: closing the old store after a failed disable failed: %v", closeErr)
++		}
++		c.running, c.cancel = store, cancel
++		log.Printf("Log persistence is ENABLED (%s)", store.path)
++		return err
++	}
++
++	// Join the sync/backfill/janitor goroutines and let the writer flush its
++	// final batch, then release both SQLite handles. A close error cannot split
++	// config and state (the Store is already unpublished and drained), so it is
++	// logged rather than surfaced.
++	old.Wait()
++	if err := old.Close(); err != nil {
++		log.Printf("logstore: closing the disabled store failed: %v", err)
++	}
++	log.Println("Log persistence is DISABLED")
++	return nil
++}
++
++// Shutdown deterministically stops the active Store at process exit. It is
++// idempotent and a no-op when persistence is off or was toggled off earlier;
++// a parent-context cancellation has usually started the drain already, and
++// Shutdown still joins it and closes the handles exactly once.
++func (c *Controller) Shutdown() {
++	c.mu.Lock()
++	c.closed = true
++	store, stop := c.running, c.cancel
++	c.running, c.cancel = nil, nil
++	c.mu.Unlock()
++
++	if stop == nil {
++		return
++	}
++	stop()
++	store.Wait()
++	if err := store.Close(); err != nil {
++		log.Printf("Closing the log store failed: %v", err)
++	}
++}
++
++// openStartLocked opens a fresh Store against the configured database path and
++// starts its pipeline. The caller must hold c.mu. The Store is returned
++// unpublished: callers publish it only after their config commit succeeds.
++func (c *Controller) openStartLocked() (*Store, context.CancelFunc, error) {
++	if c.closed || c.parent.Err() != nil {
++		return nil, nil, fmt.Errorf("%w: server is shutting down", ErrStoreUnavailable)
++	}
++
++	store, err := Open(DBPath(c.manager.ConfigFilePath()), c.manager.LogStore)
++	if err != nil {
++		return nil, nil, fmt.Errorf("%w: %v", ErrStoreUnavailable, err)
++	}
++
++	ctx, cancel := context.WithCancel(c.parent)
++	store.start(ctx, c.hub, c.source)
++	return store, cancel, nil
++}
+diff --git a/server/internal/logstore/controller_test.go b/server/internal/logstore/controller_test.go
+new file mode 100644
+index 0000000..e97d66a
+--- /dev/null
++++ b/server/internal/logstore/controller_test.go
+@@ -0,0 +1,299 @@
++package logstore
++
++import (
++	"context"
++	"errors"
++	"path/filepath"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/AmoabaKelvin/logdeck/internal/config"
++	"github.com/AmoabaKelvin/logdeck/internal/logstream"
++	"github.com/AmoabaKelvin/logdeck/internal/models"
++)
++
++var errCommitBoom = errors.New("config persistence is down")
++
++// newTestController wires a controller over a temp config/database path with
++// every LOG_STORE_* environment variable cleared, so each test owns the file
++// state.
++func newTestController(t *testing.T, containers ...models.ContainerInfo) (*Controller, *fakeHub, *fakeEngine, *config.Manager) {
++	t.Helper()
++	t.Setenv("CONFIG_PATH", filepath.Join(t.TempDir(), "config.json"))
++	for _, key := range []string{
++		"LOG_STORE_ENABLED", "LOG_STORE_PER_CONTAINER_MB",
++		"LOG_STORE_TOTAL_MB", "LOG_STORE_REMOVED_DAYS",
++	} {
++		t.Setenv(key, "")
++	}
++
++	manager := config.NewManager()
++	hub := &fakeHub{}
++	engine := newFakeEngine(containers...)
++	ctx, cancel := context.WithCancel(context.Background())
++	t.Cleanup(cancel)
++	c := NewController(ctx, manager, hub, func() Engine { return engine })
++	t.Cleanup(c.Shutdown)
++	return c, hub, engine, manager
++}
++
++func (h *fakeHub) sinkActive() bool {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	return h.sink != nil
++}
++
++// commitEnabled returns a config commit that persists the enabled flag.
++func commitEnabled(manager *config.Manager, enabled bool) func() error {
++	return func() error {
++		return manager.UpdateLogStore(func(current config.LogStoreConfig) (config.LogStoreConfig, error) {
++			value := enabled
++			current.Enabled = &value
++			return current, nil
++		})
++	}
++}
++
++func liveRecord(ts time.Time, message string) logstream.Record {
++	return logstream.Record{
++		Host: "local", ContainerID: "aaa", ContainerName: "web",
++		Entry: entryAt(ts, "stdout", message),
++	}
++}
++
++func waitForLines(t *testing.T, store *Store, want int) {
++	t.Helper()
++	waitFor(t, "stored lines", func() bool { return countLines(t, store) == want })
++}
++
++func TestControllerBootstrapDisabledStaysEmpty(t *testing.T) {
++	c, hub, _, manager := newTestController(t)
++	if err := manager.UpdateLogStore(func(current config.LogStoreConfig) (config.LogStoreConfig, error) {
++		off := false
++		current.Enabled = &off
++		return current, nil
++	}); err != nil {
++		t.Fatalf("disable in config: %v", err)
++	}
++
++	c.Bootstrap()
++
++	if store := c.CurrentStore(); store != nil {
++		t.Fatalf("CurrentStore = %v, want nil with persistence disabled", store)
++	}
++	if hub.sinkActive() {
++		t.Fatal("hub subscription exists with persistence disabled")
++	}
++}
++
++func TestControllerDisableEnableRoundTrip(t *testing.T) {
++	info := containerInfo("local", "aaa", "web", baseTime)
++	c, hub, engine, manager := newTestController(t, info)
++	c.Bootstrap()
++
++	first := c.CurrentStore()
++	if first == nil || !hub.sinkActive() {
++		t.Fatal("Bootstrap did not start the pipeline")
++	}
++	waitFor(t, "initial backfill", func() bool { return engine.calls("aaa") == 1 })
++
++	// Live lines committed before the toggle must survive it.
++	for i := 1; i <= 3; i++ {
++		hub.emit(liveRecord(baseTime.Add(time.Duration(i)*time.Second), "live"))
++	}
++	waitForLines(t, first, 3)
++
++	// Disable: input cut immediately, in-flight writes flushed, resources
++	// stopped, config persisted off.
++	if err := c.Disable(commitEnabled(manager, false)); err != nil {
++		t.Fatalf("Disable: %v", err)
++	}
++	if c.CurrentStore() != nil {
++		t.Fatal("CurrentStore non-nil after Disable")
++	}
++	if hub.sinkActive() {
++		t.Fatal("hub subscription still active after Disable")
++	}
++	if manager.LogStore().Enabled {
++		t.Fatal("config still enabled after Disable committed")
++	}
++
++	// Re-enable: same database file, hub reattached, backfill resumes from the
++	// persisted watermark with the overlap window.
++	if err := c.Enable(context.Background(), commitEnabled(manager, true)); err != nil {
++		t.Fatalf("Enable: %v", err)
++	}
++	second := c.CurrentStore()
++	if second == nil || second == first {
++		t.Fatalf("Enable did not publish a fresh store: %v", second)
++	}
++	if !hub.sinkActive() {
++		t.Fatal("hub not re-subscribed after Enable")
++	}
++	if !manager.LogStore().Enabled {
++		t.Fatal("config disabled after Enable committed")
++	}
++
++	waitFor(t, "gap backfill after re-enable", func() bool { return engine.calls("aaa") == 2 })
++	wantSince := time.Unix(0, baseTime.Add(3*time.Second).UnixNano()).Add(-backfillOverlap).
++		UTC().Format(time.RFC3339Nano)
++	if got := engine.opts("aaa").Since; got != wantSince {
++		t.Fatalf("backfill Since = %s, want watermark minus overlap %s", got, wantSince)
++	}
++
++	// Boundary discipline: the line already persisted at the edge is delivered
++	// again by the live attachment, and a genuinely new line lands once.
++	hub.emit(liveRecord(baseTime.Add(3*time.Second), "live"))
++	hub.emit(liveRecord(baseTime.Add(4*time.Second), "live"))
++	waitForLines(t, second, 4)
++}
++
++func TestControllerEnableFailureTearsPreparedStoreDown(t *testing.T) {
++	c, hub, _, manager := newTestController(t)
++	// Start from a disabled config, as a service booted with persistence off.
++	if err := manager.UpdateLogStore(func(current config.LogStoreConfig) (config.LogStoreConfig, error) {
++		off := false
++		current.Enabled = &off
++		return current, nil
++	}); err != nil {
++		t.Fatalf("disable: %v", err)
++	}
++
++	// The pipeline is prepared before the commit; a failing commit must discard
++	// it completely instead of reporting a hollow success.
++	err := c.Enable(context.Background(), func() error { return errCommitBoom })
++	if !errors.Is(err, errCommitBoom) {
++		t.Fatalf("Enable = %v, want the commit error", err)
++	}
++	if c.CurrentStore() != nil || hub.sinkActive() {
++		t.Fatal("failed Enable leaked a running store or subscription")
++	}
++	if manager.LogStore().Enabled {
++		t.Fatal("config flipped despite the failed commit")
++	}
++
++	// The same request is retryable once the fault is gone.
++	if err := c.Enable(context.Background(), commitEnabled(manager, true)); err != nil {
++		t.Fatalf("retry Enable: %v", err)
++	}
++	if c.CurrentStore() == nil || !hub.sinkActive() {
++		t.Fatal("retry did not start the pipeline")
++	}
++}
++
++func TestControllerDisableCommitFailureReopens(t *testing.T) {
++	c, hub, _, manager := newTestController(t)
++	c.Bootstrap()
++	before := c.CurrentStore()
++
++	err := c.Disable(func() error { return errCommitBoom })
++	if !errors.Is(err, errCommitBoom) {
++		t.Fatalf("Disable = %v, want the commit error surfaced", err)
++	}
++
++	// Config stayed enabled, so the runtime converges back to a fresh store.
++	after := c.CurrentStore()
++	if after == nil || after == before {
++		t.Fatalf("runtime not restored after failed Disable: %v", after)
++	}
++	if !hub.sinkActive() {
++		t.Fatal("restored store is not subscribed")
++	}
++	if !manager.LogStore().Enabled {
++		t.Fatal("config flipped despite the failed commit")
++	}
++
++	hub.emit(liveRecord(baseTime.Add(time.Second), "live"))
++	waitForLines(t, after, 1)
++}
++
++func TestControllerDuplicateRequestsAreNoop(t *testing.T) {
++	c, _, _, manager := newTestController(t)
++	c.Bootstrap()
++	running := c.CurrentStore()
++
++	// Enable while already enabled commits the config but allocates no store.
++	called := 0
++	commit := func() error { called++; return nil }
++	if err := c.Enable(context.Background(), commit); err != nil {
++		t.Fatalf("duplicate Enable: %v", err)
++	}
++	if c.CurrentStore() != running {
++		t.Fatal("duplicate Enable replaced the running store")
++	}
++	if called != 1 {
++		t.Fatalf("commit called %d times, want 1", called)
++	}
++
++	if err := c.Disable(commitEnabled(manager, false)); err != nil {
++		t.Fatalf("Disable: %v", err)
++	}
++	// Disable while already disabled only commits (used here with a failing
++	// commit to prove no store is touched on the runtime side).
++	if err := c.Disable(func() error { return errCommitBoom }); err == nil {
++		t.Fatal("expected the commit error to surface on a duplicate disable")
++	}
++	if c.CurrentStore() != nil {
++		t.Fatal("duplicate Disable started a store")
++	}
++}
++
++func TestControllerConcurrentTogglesSettle(t *testing.T) {
++	c, hub, engine, manager := newTestController(t)
++	c.Bootstrap()
++
++	var wg sync.WaitGroup
++	for i := 0; i < 8; i++ {
++		wg.Add(1)
++		go func(even bool) {
++			defer wg.Done()
++			for j := 0; j < 3; j++ {
++				if even {
++					_ = c.Disable(commitEnabled(manager, false))
++					_ = c.Enable(context.Background(), commitEnabled(manager, true))
++				} else {
++					_ = c.Enable(context.Background(), commitEnabled(manager, true))
++					_ = c.Disable(commitEnabled(manager, false))
++				}
++			}
++		}(i%2 == 0)
++	}
++	wg.Wait()
++
++	if err := c.Enable(context.Background(), commitEnabled(manager, true)); err != nil {
++		t.Fatalf("settle Enable: %v", err)
++	}
++	store := c.CurrentStore()
++	if store == nil || !hub.sinkActive() {
++		t.Fatal("pipeline not running after the toggle storm")
++	}
++	_ = engine
++	hub.emit(liveRecord(baseTime.Add(10*time.Second), "settled"))
++	waitForLines(t, store, 1)
++}
++
++func TestControllerToggleAfterShutdownRejected(t *testing.T) {
++	c, _, _, _ := newTestController(t)
++	c.Bootstrap()
++	c.Shutdown()
++
++	commits := 0
++	noCommit := func() error { commits++; return nil }
++
++	if err := c.Enable(context.Background(), noCommit); !errors.Is(err, ErrStoreUnavailable) {
++		t.Fatalf("Enable after Shutdown = %v, want ErrStoreUnavailable", err)
++	}
++	if err := c.Disable(noCommit); !errors.Is(err, ErrStoreUnavailable) {
++		t.Fatalf("Disable after Shutdown = %v, want ErrStoreUnavailable", err)
++	}
++	if commits != 0 {
++		t.Fatalf("commit ran %d times after shutdown", commits)
++	}
++	if c.CurrentStore() != nil {
++		t.Fatal("store published after shutdown")
++	}
++
++	// Shutdown is idempotent.
++	c.Shutdown()
++}

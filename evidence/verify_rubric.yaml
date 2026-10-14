@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 成功关闭会先封住新的持久化输入，排空并提交已接纳写入，停止 logstream 订阅与 janitor、关闭 SQLite；历史文件保留，而状态、查询、Web 与 MCP 立即一致显示禁用。
+  - id: 2
+    type: f2p
+    text: 成功开启会打开已有数据库、启动 Store 并重新接入 logstream/registry，利用既有水位线和去重补齐停用区间；只有资源和回补就绪后才报告启用，边界日志不重不漏。
+  - id: 3
+    type: f2p
+    text: 数据库打开、排空、关闭或配置持久化失败不会留下 desired config 与实际 Store 状态分裂；接口返回明确非成功或降级信息，保留可用旧状态或完成回滚，故障解除后可重试。
+  - id: 4
+    type: f2p
+    text: 并发启用、关闭、重复请求与服务 shutdown 有确定顺序和幂等结果，不会重复启动或关闭，也不泄漏 goroutine、订阅、janitor 或 SQLite 句柄。
+  - id: 5
+    type: p2p
+    text: 环境变量固定的 enabled 仍拒绝 UI 改写；默认启用、启动时启用或禁用、以及原有 history 权限和禁用响应保持兼容。
+  - id: 6
+    type: p2p
+    text: 运行中只调整 perContainerMB、totalMB 或 removedDays 的现有行为不退化，已有 SQLite schema、历史记录、removed-container 清理与查询结果继续可读。
+  - id: 7
+    type: f2p
+    text: 自动化验证覆盖设置 API、配置回滚、Store 生命周期、停用区间回补、history/Web/MCP 外部状态，以及打开失败、排空失败、重试和 shutdown 竞态。

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -18,31 +19,58 @@ import (
 	"github.com/go-chi/cors"
 )
 
+// logStoreProvider supplies the running log store. *logstore.Controller is the
+// production implementation; its pointer changes when persistence is toggled
+// at runtime. A nil provider (used by stripped builds and unit tests) behaves
+// as "persistence is off".
+type logStoreProvider interface {
+	CurrentStore() *logstore.Store
+}
+
+// logStoreLifecycle drives the runtime toggle. Split from logStoreProvider so
+// the read-only history routes only depend on the lookup they need.
+type logStoreLifecycle interface {
+	logStoreProvider
+	Enable(ctx context.Context, commit func() error) error
+	Disable(commit func() error) error
+}
+
 type APIRouter struct {
 	router   *chi.Mux
 	registry *services.Registry
 	manager  *config.Manager
 	engine   *alerts.Engine
-	// logStore is nil when log persistence is disabled or unusable.
-	logStore *logstore.Store
-	version  string
+	// logStores is nil (or returns nil) when log persistence is disabled or
+	// unusable.
+	logStores logStoreProvider
+	version   string
 
 	// machineHostname caches the engine-reported hostname; see GetSystemStats.
 	machineHostnameMu sync.Mutex
 	machineHostname   string
 }
 
-func NewRouter(registry *services.Registry, manager *config.Manager, engine *alerts.Engine, logStore *logstore.Store, version string) *chi.Mux {
+func NewRouter(registry *services.Registry, manager *config.Manager, engine *alerts.Engine, logStores logStoreProvider, version string) *chi.Mux {
 	r := &APIRouter{
-		router:   chi.NewRouter(),
-		registry: registry,
-		manager:  manager,
-		engine:   engine,
-		logStore: logStore,
-		version:  version,
+		router:    chi.NewRouter(),
+		registry:  registry,
+		manager:   manager,
+		engine:    engine,
+		logStores: logStores,
+		version:   version,
 	}
 
 	return r.Routes()
+}
+
+// activeLogStore returns the currently running store, or nil when persistence
+// is off. Resolved per request so a runtime toggle takes effect immediately
+// for every subsequent request.
+func (ar *APIRouter) activeLogStore() *logstore.Store {
+	if ar.logStores == nil {
+		return nil
+	}
+	return ar.logStores.CurrentStore()
 }
 
 func WriteJsonResponse(w http.ResponseWriter, status int, data any) {

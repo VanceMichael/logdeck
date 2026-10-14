@@ -23,6 +23,12 @@ import (
 
 var historyBase = time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
 
+// staticLogStores is a non-toggling provider for handler tests that own a
+// store's lifecycle directly.
+type staticLogStores struct{ store *logstore.Store }
+
+func (s staticLogStores) CurrentStore() *logstore.Store { return s.store }
+
 // newHistoryTestRouter builds a router around the given store (nil means log
 // persistence is disabled) with auth off.
 func newHistoryTestRouter(t *testing.T, store *logstore.Store) http.Handler {
@@ -43,7 +49,11 @@ func newHistoryTestRouterWithAuth(t *testing.T, store *logstore.Store, authSvc *
 	manager := config.NewManager()
 	registry := services.NewRegistry(nil, nil, authSvc, manager.Config())
 	engine := alerts.NewEngine(registry, manager, nil)
-	return NewRouter(registry, manager, engine, store, "test")
+	var provider logStoreProvider
+	if store != nil {
+		provider = staticLogStores{store: store}
+	}
+	return NewRouter(registry, manager, engine, provider, "test")
 }
 
 // newHistoryStore opens a real store over a temp database and returns it with
@@ -759,7 +769,7 @@ func TestDeleteHistoryContainerReadOnlyMode(t *testing.T) {
 
 	manager := config.NewManager()
 	registry := services.NewRegistry(nil, nil, nil, manager.Config())
-	router := NewRouter(registry, manager, alerts.NewEngine(registry, manager, nil), store, "test")
+	router := NewRouter(registry, manager, alerts.NewEngine(registry, manager, nil), staticLogStores{store: store}, "test")
 
 	w := doHistoryDelete(t, router, "/api/v1/history/containers/web?host=local", "")
 	if w.Code != http.StatusForbidden {

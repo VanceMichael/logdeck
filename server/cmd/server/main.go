@@ -74,13 +74,28 @@ func main() {
 		log.Println("Coolify integration is DISABLED")
 	}
 
+	// The process lifecycle context. It is created before the long-lived
+	// components so each can bind its own cancellable children to it (the log
+	// store toggles its pipeline at runtime, but always drains when this ends).
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	// Once the first signal starts the graceful shutdown, restore default
+	// signal handling so a second Ctrl-C terminates the process immediately.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+
 	registry := services.NewRegistry(multiHostClient, coolifyClient, authService, cfg)
 
 	logHub := logstream.New(registry)
 	alertEngine := alerts.NewEngine(registry, manager, logHub)
-	// logStore is nil when persistence is disabled or its database is
-	// unusable; every consumer must treat that as "no stored logs".
-	logStore := logstore.OpenFromConfig(manager)
+	// logStoreCtl owns the optional persistence pipeline and its runtime
+	// toggling. A nil current store (disabled or unusable database) means
+	// "no stored logs" for every consumer.
+	logStoreCtl := logstore.NewController(ctx, manager, logHub, func() logstore.Engine {
+		return registry.Docker()
+	})
 
 	manager.OnChange(func(newCfg *config.Config) {
 		registry.UpdateConfig(newCfg)
@@ -114,7 +129,7 @@ func main() {
 		log.Println("Configuration reloaded successfully")
 	})
 
-	apiRouter := api.NewRouter(registry, manager, alertEngine, logStore, version)
+	apiRouter := api.NewRouter(registry, manager, alertEngine, logStoreCtl, version)
 
 	// No WriteTimeout/IdleTimeout: log streaming and terminal WebSockets are
 	// long-lived connections and would be killed by them. ReadTimeout only
@@ -127,23 +142,16 @@ func main() {
 		ReadTimeout:       30 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	// Request contexts end with ctx, so open log and event streams close on
 	// shutdown instead of holding it until Docker kills the process.
 	server.BaseContext = func(net.Listener) context.Context { return ctx }
-	// Once the first signal starts the graceful shutdown, restore default
-	// signal handling so a second Ctrl-C terminates the process immediately.
-	go func() {
-		<-ctx.Done()
-		stop()
-	}()
 
 	go logHub.Run(ctx)
 	alertEngine.Start(ctx)
-	if logStore != nil {
-		logStore.Start(ctx, logHub, registry)
-	}
+	// Subscribe only once the hub run loop is serving: the hub's Subscribe
+	// blocks until then. A disabled config or an unusable database leaves the
+	// controller empty; runtime toggles go through it afterwards.
+	logStoreCtl.Bootstrap()
 
 	// PPROF_ADDR=127.0.0.1:6060 exposes Go runtime profiles (heap, goroutines)
 	// on a separate listener. Off unless set. The profiles are unauthenticated,
@@ -177,10 +185,5 @@ func main() {
 	// hub, so its final batch can only be complete once the hub has stopped.
 	alertEngine.Wait()
 	logHub.Wait()
-	if logStore != nil {
-		logStore.Wait()
-		if err := logStore.Close(); err != nil {
-			log.Printf("Closing the log store failed: %v", err)
-		}
-	}
+	logStoreCtl.Shutdown()
 }

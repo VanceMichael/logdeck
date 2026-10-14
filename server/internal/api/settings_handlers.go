@@ -16,6 +16,7 @@ import (
 	"github.com/AmoabaKelvin/logdeck/internal/config"
 	"github.com/AmoabaKelvin/logdeck/internal/coolify"
 	"github.com/AmoabaKelvin/logdeck/internal/docker"
+	"github.com/AmoabaKelvin/logdeck/internal/logstore"
 )
 
 const secretMask = "••••••••"
@@ -261,7 +262,10 @@ const maxLogStoreRemovedDays = 3650
 
 // UpdateLogStorage handles PUT /api/v1/settings/log-storage. Every field is
 // optional; only the ones provided change. The janitor re-reads the caps on
-// each pass, so a new cap takes effect without a restart.
+// each pass, so a new cap takes effect without a restart. Toggling enabled
+// starts or stops the whole persistence pipeline through the log store
+// controller, and the config commit is coordinated with that transition so a
+// failure never leaves config and runtime disagreeing.
 func (ar *APIRouter) UpdateLogStorage(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Enabled        *bool `json:"enabled"`
@@ -311,7 +315,7 @@ func (ar *APIRouter) UpdateLogStorage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := ar.manager.UpdateLogStore(func(current config.LogStoreConfig) (config.LogStoreConfig, error) {
+	mutate := func(current config.LogStoreConfig) (config.LogStoreConfig, error) {
 		if req.Enabled != nil {
 			current.Enabled = req.Enabled
 		}
@@ -325,9 +329,34 @@ func (ar *APIRouter) UpdateLogStorage(w http.ResponseWriter, r *http.Request) {
 			current.RemovedDays = req.RemovedDays
 		}
 		return current, nil
-	})
+	}
+	commit := func() error { return ar.manager.UpdateLogStore(mutate) }
+
+	// Drive the runtime transition when the enabled flag actually flips relative
+	// to the running pipeline. Comparing against the runtime (not the file
+	// value) also self-heals a start whose database failed to open: repeating
+	// "enabled" retries the start instead of reporting a hollow 200.
+	running := ar.activeLogStore() != nil
+	var err error
+	switch lifecycle, _ := ar.logStores.(logStoreLifecycle); {
+	case lifecycle == nil:
+		// No runtime owner wired in (unit builds): persist the value only.
+		err = commit()
+	case req.Enabled != nil && *req.Enabled && !running:
+		err = lifecycle.Enable(r.Context(), commit)
+	case req.Enabled != nil && !*req.Enabled && running:
+		err = lifecycle.Disable(commit)
+	default:
+		err = commit()
+	}
 	if err != nil {
-		http.Error(w, err.Error(), settingsErrorStatus(err))
+		// A store that could not be opened/stopped is a degraded service, not a
+		// bad request: surface 503 with the cause instead of a misleading 200.
+		status := settingsErrorStatus(err)
+		if errors.Is(err, logstore.ErrStoreUnavailable) {
+			status = http.StatusServiceUnavailable
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 
